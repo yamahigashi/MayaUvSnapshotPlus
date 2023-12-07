@@ -22,14 +22,6 @@ It highlights edges by their type to help you create UV maps that are easier to 
 - **Maya Version**: Autodesk Maya 2020 and later verisons.
 
 
-## How to Use
-
-1. Open Autodesk Maya.
-2. Launch the Maya UV Snapshot Plus tool.
-3. Main Menu > Window > `UV Snapshot Plus`
-4. Adjust the settings for edge color and width as needed.
-5. Click the 'Take Snapshot!' button to generate the UV snapshot.
-
 ## Installation
 - Download the [zip](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/v0.1.1/mayauvsnapshotplus_v0.1.1.zip) file from the [Releases page](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases).
 - Unzip the downloaded file.
@@ -49,10 +41,20 @@ If you are not familiar with handling environment variables, method a. is recomm
 <img src="https://raw.githubusercontent.com/yamahigashi/MayaUvSnapshotPlus/doc/doc/Screenshot_612.png" width="660">
 
 
+
+
+## How to Use
+
+1. Open Autodesk Maya.
+2. Launch the Maya UV Snapshot Plus tool. via Main Menu > Window > `UV Snapshot Plus`
+3. Adjust the settings for edge color and width as needed.
+4. Select a Mesh.
+5. Click the 'Take Snapshot!' button to generate the UV snapshot.
+
+
 ## License
 
 This project is published under the [MIT License]().
-Support and Contact
 
 
 ----
@@ -66,20 +68,10 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 ## 主な特徴
 
 - ハードエッジ表示: モデルの重要なエッジを強調表示。
-- UVシーム検出: UVマップの切断線を明確に表示。 (maya2023以降）
-- エッジクリース強調: 折りたたみや曲線部分のエッジを視覚的に識別。
+- UVボーダー検出: UVマップの切断線を明確に表示。 (maya2023以降）
+- 折りたたみエッジ強調: 折りたたみや曲線部分のエッジを視覚的に識別。
 - 任意角度のエッジの表示：指定角度以上の2面があるエッジを表示。
 - カスタマイズ可能な色と幅: ユーザーの好みや特定のニーズに合わせて、エッジの色と幅を調整可能。
-
-
-## 使用方法
-
-1. Autodesk Mayaを開きます。
-2. Maya UV Snapshot Plusツールを起動します。
-3. メインメニュー > ウィンドウ > `UV Snapshot Edge drawer` より起動
-4. 必要に応じて、エッジの色や幅の設定を調整します。
-5. 「Take Snapshot!」ボタンをクリックして、UVスナップショットを生成します。
-
 
 ## インストール
 
@@ -91,12 +83,22 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 A. `マイドキュメント内 maya\modules` フォルダへ配置する
 B. 適当な場所に配置しシステムの環境変数へ登録する
 ```
-
     
 環境変数の扱いに不慣れであれば a. をおすすめします。
 a. について詳解します
 1. マイドキュメントフォルダを開く
 2. maya内に `modules` フォルダがない場合作成します
-3. 作成したフォルダ内に配置します
+3. 作成したフォルダ `modules` 内に解凍したファイル MayaUvSnapshotPlusフォルダおよび、MayaUvSnapshotPlus.mod ファイルを配置します
 
 <img src="https://raw.githubusercontent.com/yamahigashi/MayaUvSnapshotPlus/doc/doc/Screenshot_612.png" width="660">
+
+
+## 使用方法
+
+1. Autodesk Mayaを開きます。
+2. Maya UV Snapshot Plusツールを起動します。メインメニュー > ウィンドウ > `UV Snapshot Plus` を実行します
+3. ポップしたウィンドにて必要に応じて、エッジの色や幅の設定を調整します。
+4. メッシュを選択します。
+5. 「Take Snapshot!」ボタンをクリックして、UVスナップショットを生成します。
+
+
