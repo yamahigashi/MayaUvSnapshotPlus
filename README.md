@@ -31,7 +31,7 @@ It highlights edges by their type to help you create UV maps that are easier to 
 5. Click the 'Take Snapshot!' button to generate the UV snapshot.
 
 ## Installation
-- Download the [zip](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.1/mayauvsnapshotplus_v0.1.1.zip) file from the [Releases page](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases).
+- Download the [zip](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/v0.1.1/mayauvsnapshotplus_v0.1.1.zip) file from the [Releases page](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases).
 - Unzip the downloaded file.
 - Place the unzipped files in a folder that is recognized by the `MAYA_MODULE_PATH`, using one of the following methods:
 
@@ -83,7 +83,7 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 
 ## インストール
 
-1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.1/mayauvsnapshotplus_v0.1.0.zip) を取得します 
+1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/v0.1.1/mayauvsnapshotplus_v0.1.0.zip) を取得します 
 2. ダウンロードしたファイルを解凍します
 3. 以下いずれかの方法で `MAYA_MODULE_PATH` の通ったフォルダへ配置します
 
