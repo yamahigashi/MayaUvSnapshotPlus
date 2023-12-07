@@ -83,7 +83,7 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 
 ## インストール
 
-1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/v0.1.1/mayauvsnapshotplus_v0.1.0.zip) を取得します 
+1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/v0.1.1/mayauvsnapshotplus_v0.1.1.zip) を取得します 
 2. ダウンロードしたファイルを解凍します
 3. 以下いずれかの方法で `MAYA_MODULE_PATH` の通ったフォルダへ配置します
 
