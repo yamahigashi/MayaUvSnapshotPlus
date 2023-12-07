@@ -60,6 +60,31 @@ def get_current_uv_set_id(fn_mesh):
     return current_set_id
 
 
+def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
+    # type: (om.MFnMesh, om.MItMeshVertex, om.MItMeshEdge, str, Optional[int]) -> List[EdgeLine]
+
+    if face_id is None:
+        res = []
+        conncetded_ids = it_edge.getConnectedFaces()
+        for face_id in conncetded_ids:
+            res.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id))  # noqa: E501
+
+        return res
+
+    vert1 = it_edge.vertexId(0)
+    vert2 = it_edge.vertexId(1)
+
+    it_vert.setIndex(vert1)
+    uv1 = it_vert.getUV(face_id, uv_set_name)
+
+    it_vert.setIndex(vert2)
+    uv2 = it_vert.getUV(face_id, uv_set_name)
+
+    line = EdgeLine(fn_mesh, it_edge.index(), uv1, uv2)
+
+    return [line]
+
+
 def get_edge_lines(
         fn_mesh,
         hard=True,
@@ -71,9 +96,6 @@ def get_edge_lines(
 ):
     # type: (om.MFnMesh, bool, bool, bool, bool, bool, float) -> List[List[EdgeLine]]
     """ メッシュの各種エッジラインを取得する"""
-
-    if not hard and not soft and not fold:
-        return [[], [], [], []]
 
     result = []
     hard_edges_uvs = []
@@ -89,38 +111,32 @@ def get_edge_lines(
     it_edge = om.MItMeshEdge(fn_mesh.object())
     it_face = om.MItMeshPolygon(fn_mesh.object())
 
-    def get_current_edge_line(face_id=None):
-        # type: (Optional[int]) -> List[EdgeLine]
+    if crease:
+        try:  # noqa: FURB107
+            crease_ids, _ = fn_mesh.getCreaseEdges()
+            for edge_id in crease_ids:
+                it_edge.setIndex(edge_id)
+                lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
+                crease_edges.extend(lines)
+        except RuntimeError:
+            # if no crease edge, maya raise RuntimeError....
+            pass
 
-        if face_id is None:
-            res = []
-            conncetded_ids = it_edge.getConnectedFaces()
-            for face_id in conncetded_ids:
-                res.extend(get_current_edge_line(face_id))
-
-            return res
-
-        vert1 = it_edge.vertexId(0)
-        vert2 = it_edge.vertexId(1)
-
-        it_vert.setIndex(vert1)
-        uv1 = it_vert.getUV(face_id, uv_set_name)
-
-        it_vert.setIndex(vert2)
-        uv2 = it_vert.getUV(face_id, uv_set_name)
-
-        line = EdgeLine(fn_mesh, it_edge.index(), uv1, uv2)
-
-        return [line]
+    if border:
+        border_ids = fn_mesh.getUVBorderEdges(current_uv_set_id)
+        for edge_id in border_ids:
+            it_edge.setIndex(edge_id)
+            lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
+            border_edges.extend(lines)
 
     while not it_edge.isDone():
 
         if hard and not it_edge.isSmooth:
-            lines = get_current_edge_line()
+            lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
             hard_edges_uvs.extend(lines)
 
         if soft and it_edge.isSmooth:
-            lines = get_current_edge_line()
+            lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
             soft_edges_uvs.extend(lines)
 
         if fold and it_edge.numConnectedFaces() >= 2:
@@ -139,30 +155,12 @@ def get_edge_lines(
             angle = norm1.angle(norm2)
 
             if angle > math.radians(fold_angle):
-                lines = get_current_edge_line(face_id1)
+                lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id1)
                 fold_edges_uvs.extend(lines)
-                lines = get_current_edge_line(face_id2)
+                lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id2)
                 fold_edges_uvs.extend(lines)
 
         it_edge.next()
-
-    if crease:
-        try:  # noqa: FURB107
-            crease_ids, _ = fn_mesh.getCreaseEdges()
-            for edge_id in crease_ids:
-                it_edge.setIndex(edge_id)
-                lines = get_current_edge_line()
-                crease_edges.extend(lines)
-        except RuntimeError:
-            # if no crease edge, maya raise RuntimeError....
-            pass
-
-    if border:
-        border_ids = fn_mesh.getUVBorderEdges(current_uv_set_id)
-        for edge_id in border_ids:
-            it_edge.setIndex(edge_id)
-            lines = get_current_edge_line()
-            border_edges.extend(lines)
 
     result.append(hard_edges_uvs)
     result.append(soft_edges_uvs)
@@ -191,8 +189,8 @@ def execute_drawer(image_path, json_data):
     # type: (Text, Text) -> None
     """ エッジのUV座標を元にエッジラインを描画する"""
 
-    if len(json_data) > 7500:  # windows cmd line length limit is 8191
-    # if len(json_data) > 0:  # windows cmd line length limit is 8191
+    # if len(json_data) > 7500:  # windows cmd line length limit is 8191
+    if len(json_data) > 0:  # windows cmd line length limit is 8191
 
         with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
             temp_file.write(json_data)
@@ -208,10 +206,6 @@ def execute_drawer(image_path, json_data):
 
     subprocess.call(cmd, shell=True)
     subprocess.call("start " + image_path, shell=True)
-
-
-def set_output_path(path):
-    cmds.textFieldButtonGrp("filenameField", edit=True, text=path)
 
 
 def show_ui():
@@ -237,6 +231,7 @@ def show_ui():
         adjustableColumn3=2,
         buttonLabel="Browse...",
         buttonCommand=textwrap.dedent("""
+            import uv_snapshot_edge_drawer as drawer
             sd = cmds.workspace(q=True, rootDirectory=True)
             res = cmds.fileDialog2(
                 fileMode=0,
@@ -248,7 +243,7 @@ def show_ui():
             )
             if res:
                 cmds.optionVar(sv=('uvSnapshotFileName', res[0]))
-                set_output_path(res[0])
+                cmds.textFieldButtonGrp("filenameField", edit=True, text=res[0])
         """)
     )
     
@@ -259,16 +254,21 @@ def show_ui():
     cmds.menuItem(label="TIFF")
     
     # Size controls
-    cmds.intSliderGrp("resoX", label="Size X (px):", field=True, min=1, max=4096, value=2048)
-    cmds.intSliderGrp("resoY", label="Size Y (px):", field=True, min=1, max=4096, value=2048)
+    cmds.intSliderGrp("resoX", label="Size X (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
+    cmds.intSliderGrp("resoY", label="Size Y (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
     
     # Checkboxes
     # cmds.checkBoxGrp(label="", label1="Lock aspect ratio", value1=True)
     cmds.checkBoxGrp("antialias", label="", label1="Anti-alias lines")
     # cmds.checkBoxGrp(label1="Soft Edge", value1=False)
     cmds.checkBoxGrp("exportHardEdge", label="", label1="Hard Edge", value1=True)
-    cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=True)
-    cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=True)
+
+    if cmds.about(apiVersion=True) >= 20230000:
+        cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=True)  # noqa: E501
+        cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=True)  # noqa: E501
+    else:
+        cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=False, enable=False)  # noqa: E501
+        cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=False, enable=False)  # noqa: E501
     cmds.checkBoxGrp("exportFoldEdge", label="", label1="Fold Edge", value1=False)
 
     cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501
@@ -381,6 +381,17 @@ def snapshot():
     )
 
     tmp_json = []
+    if fold_edge:
+        tmp_json.append({
+            "line_color": [
+                int(fold_edge_color[0] * 255),
+                int(fold_edge_color[1] * 255),
+                int(fold_edge_color[2] * 255),
+                255
+            ],
+            "line_width": fold_edge_width,
+            "lines": edges[4]
+        })
     if hard_edge:
         tmp_json.append({
             "line_color": [
@@ -391,6 +402,17 @@ def snapshot():
             ],
             "line_width": hard_edge_width,
             "lines": edges[0]
+        })
+    if crease_edge:
+        tmp_json.append({
+            "line_color": [
+                int(crease_edge_color[0] * 255),
+                int(crease_edge_color[1] * 255),
+                int(crease_edge_color[2] * 255),
+                255
+            ],
+            "line_width": crease_edge_width,
+            "lines": edges[3]
         })
     if border_edge:
         tmp_json.append({
@@ -403,31 +425,17 @@ def snapshot():
             "line_width": border_edge_width,
             "lines": edges[2]
         })
-    if crease_edge:
-        tmp_json.append({
-            "line_color": [
-                int(crease_edge_color[0] * 255),
-                int(crease_edge_color[1] * 255),
-                int(crease_edge_color[2] * 255),
-                255
-            ],
-            "line_width": crease_edge_width,
-            "lines": edges[2]
-        })
-    if fold_edge:
-        tmp_json.append({
-            "line_color": [
-                int(fold_edge_color[0] * 255),
-                int(fold_edge_color[1] * 255),
-                int(fold_edge_color[2] * 255),
-                255
-            ],
-            "line_width": fold_edge_width,
-            "lines": edges[3]
-        })
 
     json_data = edges_to_json_string(tmp_json)
     execute_drawer(file_path, json_data)
+    cmds.inViewMessage(
+        amg="Exported: {}".format(file_path),
+        pos="topCenter",
+        fade=True,
+        alpha=0.9,
+        fadeStayTime=10000,
+        fadeOutTime=1000
+    )
 
 
 def foo():
