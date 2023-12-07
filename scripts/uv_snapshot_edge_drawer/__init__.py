@@ -265,10 +265,9 @@ def show_ui():
 
     if cmds.about(apiVersion=True) >= 20230000:
         cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=True)  # noqa: E501
-        cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=True)  # noqa: E501
     else:
         cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=False, enable=False)  # noqa: E501
-        cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=False, enable=False)  # noqa: E501
+    cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=True)  # noqa: E501
     cmds.checkBoxGrp("exportFoldEdge", label="", label1="Fold Edge", value1=False)
 
     cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501

@@ -12,7 +12,7 @@ It highlights edges by their type to help you create UV maps that are easier to 
 
 - Hard Edge Display: Emphasizes critical edges of the model.
 - UV Seam Detection: Clearly indicates the seams in UV maps. (maya 2023 or later)
-- Edge Crease Highlighting: Visually identifies folding or curved edges. (maya 2023 or later)
+- Edge Crease Highlighting: Visually identifies folding or curved edges.
 - Display of edges any angle: Edges with two or more sides at a specified angle are displayed.
 - Customizable Colors and Widths: Adjust the edge colors and widths according to user preference or specific needs.
 
@@ -31,7 +31,7 @@ It highlights edges by their type to help you create UV maps that are easier to 
 5. Click the 'Take Snapshot!' button to generate the UV snapshot.
 
 ## Installation
-- Download the [zip](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.0/mayauvsnapshotplus_0.1.0.zip) file from the [Releases page](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases).
+- Download the [zip](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.1/mayauvsnapshotplus_v0.1.1.zip) file from the [Releases page](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases).
 - Unzip the downloaded file.
 - Place the unzipped files in a folder that is recognized by the `MAYA_MODULE_PATH`, using one of the following methods:
 
@@ -67,7 +67,7 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 
 - ハードエッジ表示: モデルの重要なエッジを強調表示。
 - UVシーム検出: UVマップの切断線を明確に表示。 (maya2023以降）
-- エッジクリース強調: 折りたたみや曲線部分のエッジを視覚的に識別。(maya2023以降）
+- エッジクリース強調: 折りたたみや曲線部分のエッジを視覚的に識別。
 - 任意角度のエッジの表示：指定角度以上の2面があるエッジを表示。
 - カスタマイズ可能な色と幅: ユーザーの好みや特定のニーズに合わせて、エッジの色と幅を調整可能。
 
@@ -83,7 +83,7 @@ Maya UV Snapshot Plusは、Autodesk Maya用のUVスナップショットツー�
 
 ## インストール
 
-1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.0/mayauvsnapshotplus_0.1.0.zip) を取得します 
+1. [リリースページ](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases) より [zipファイル](https://github.com/yamahigashi/MayaUvSnapshotPlus/releases/download/0.1.1/mayauvsnapshotplus_v0.1.0.zip) を取得します 
 2. ダウンロードしたファイルを解凍します
 3. 以下いずれかの方法で `MAYA_MODULE_PATH` の通ったフォルダへ配置します
 
