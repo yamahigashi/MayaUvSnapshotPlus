@@ -239,19 +239,13 @@ def show_ui():
                 okCaption='Select',
                 dialogStyle=2,
                 startingDirectory=sd,
-                fileFilter='Image Files (*.jpg *.png *.tiff *.tga);;*.jpg;;*.png;;*.tiff;;*.tga'
+                fileFilter='*.png'
             )
             if res:
                 cmds.optionVar(sv=('uvSnapshotFileName', res[0]))
                 cmds.textFieldButtonGrp("filenameField", edit=True, text=res[0])
         """)
     )
-    
-    # Image format dropdown menu
-    cmds.optionMenuGrp("format", label="Image Format")
-    cmds.menuItem(label="JPG")
-    cmds.menuItem(label="PNG")
-    cmds.menuItem(label="TIFF")
     
     # Size controls
     cmds.intSliderGrp("resoX", label="Size X (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
@@ -317,9 +311,12 @@ def snapshot():
 
     aa = cmds.checkBoxGrp("antialias", query=True, value1=True)
     entire_uv_range = cmds.radioButtonGrp("uvAreaType", query=True, select=True) == 1
-    file_format = cmds.optionMenuGrp("format", query=True, value=True).lower()
+    file_format = "png"
     # uv_set_name = cmds.textFieldGrp("", query=True, text=True)
     file_path = cmds.textFieldButtonGrp("filenameField", query=True, text=True)
+    if not file_path.endswith(".png"):
+        file_path += ".png"
+
     overwrite = True
     red_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)[0] * 255  # noqa: E501
     blue_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)[1] * 255  # noqa: E501
