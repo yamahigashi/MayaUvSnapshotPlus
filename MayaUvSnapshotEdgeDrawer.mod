@@ -1,2 +1,2 @@
-+ UvSnapshotEdgeDrawer 0.1 ./MayaUvSnapshotEdgeDrawer
++ UvSnapshotEdgeDrawer 0.1 ./MayaUvSnapshotPlus
 PATH +:= ./bin
