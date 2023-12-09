@@ -39,7 +39,7 @@ def show_ui():
 
     gOptionBoxTemplateOffsetText = mel.eval("""$tmp = $gOptionBoxTemplateOffsetText;""")  #  type: int
     gOptionBoxTemplateTextColumnWidth = mel.eval("""$tmp = $gOptionBoxTemplateTextColumnWidth;""")  #  type: int
-    gOptionBoxTemplateSingleWidgetWidth = mel.eval("""$tmp = $gOptionBoxTemplateSingleWidgetWidth;""")  #  type: int
+    # gOptionBoxTemplateSingleWidgetWidth = mel.eval("""$tmp = $gOptionBoxTemplateSingleWidgetWidth;""")  #  type: int
     gOptionBoxTemplateSliderWidgetWidth= mel.eval("""$tmp = $gOptionBoxTemplateSliderWidgetWidth;""")  #  type: int
 
     if cmds.window("settingsWindow", exists=True):
@@ -225,8 +225,10 @@ def get_uv_min_max():
 
 def uv_snapchot_ctrl_changed(*args):
     uv_range = cmds.radioButtonGrp("uvAreaTileCtrl", query=True, select=True) == 1
+
     cmds.intField("uvAreaTileU", edit=True, enable=uv_range)
     cmds.intField("uvAreaTileV", edit=True, enable=uv_range)
+
     cmds.floatSliderGrp("uvSnapshotUMinCtrl", edit=True, enable=not uv_range)
     cmds.floatSliderGrp("uvSnapshotUMaxCtrl", edit=True, enable=not uv_range)
     cmds.floatSliderGrp("uvSnapshotVMinCtrl", edit=True, enable=not uv_range)
@@ -234,23 +236,10 @@ def uv_snapchot_ctrl_changed(*args):
 
 
 def snapshot():
-    mesh = cmds.ls(sl=True, dag=True, type="mesh")
-    if not mesh:
-        cmds.warning("Select some mesh")
-        return
-
-    # entire_uv_range = cmds.radioButtonGrp("uvAreaType", query=True, select=True) == 1
-    file_format = "png"
-    # uv_set_name = cmds.textFieldGrp("", query=True, text=True)
     file_path = cmds.textFieldButtonGrp("filenameField", query=True, text=True)
     if not file_path.endswith(".png"):
         file_path += ".png"
 
-    overwrite = True
-    u_max = 1.0
-    u_min = 0.0
-    v_max = 1.0
-    v_min = 0.0
     x_resolution = cmds.intSliderGrp("resoX", query=True, value=True)
     y_resolution = cmds.intSliderGrp("resoY", query=True, value=True)
 
@@ -284,10 +273,17 @@ def snapshot():
     config.update_settings("crease", crease_edge, crease_edge_color, crease_edge_width)
     config.update_settings("fold", fold_edge, fold_edge_color, fold_edge_width, fold_angle)
 
-    edges = drawer.MeshEdges(mesh[0], config)
-    u_min, u_max, v_min, v_max = get_uv_min_max()
-    draw_info = edges.get_draw_info(u_min, u_max, v_min, v_max)
-    tmp_json = list(draw_info.values())
+    tmp_json = []
+    mesh = cmds.ls(sl=True, dag=True, type="mesh")
+    if not mesh:
+        cmds.warning("Select some mesh")
+        return
+
+    for m in mesh:
+        edges = drawer.MeshEdges(m, config)
+        u_min, u_max, v_min, v_max = get_uv_min_max()
+        draw_info = edges.get_draw_info(u_min, u_max, v_min, v_max)
+        tmp_json.extend(list(draw_info.values()))
 
     json_data = drawer.edges_to_json_string(tmp_json)
     drawer.execute_drawer(file_path, x_resolution, y_resolution, json_data)
