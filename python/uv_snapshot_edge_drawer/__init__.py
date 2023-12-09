@@ -344,13 +344,21 @@ def execute_drawer(image_path, width, height, json_data):
         json_data,
     ])
 
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    # stdout = result.stdout
-    stderr = result.stderr
-    if stderr:
-        print(cmd)
-        cmds.error(stderr)
-        return
+    if sys.version_info > (3, 0):
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        # stdout = result.stdout
+        stderr = result.stderr
+        if stderr:
+            print(cmd)
+            cmds.error(stderr)
+            return
+    else:
+        # python 2.7 does not have subprocess.run
+        result = subprocess.call(cmd, shell=True)
+        if result != 0:
+            print(cmd)
+            cmds.error("edge_drawer.exe error")
+            return
 
     subprocess.call("start " + image_path, shell=True)
 
