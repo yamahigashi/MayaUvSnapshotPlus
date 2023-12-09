@@ -45,11 +45,11 @@ def register_menu():
     item = cmds.menuItem(
         "uv_snapshot_edge_line_show_ui",
         label="UV Snapshot Plus",
-        annotation="open UV Snapshot Edge Line Drawer",
+        annotation="open UV Snapshot Plus window",
         echoCommand=True,
         command=textwrap.dedent(
             """
-                import uv_snapshot_edge_drawer as drawer
+                import uv_snapshot_edge_drawer.ui as drawer
                 drawer.show_ui()
             """)
     )

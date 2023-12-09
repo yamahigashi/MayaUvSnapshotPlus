@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """ Draw edge lines on UV Snapshot images"""
-import os
 import sys
 import math
 import json
 import tempfile
 import subprocess
-import textwrap
 
 from maya.api import OpenMaya as om
 from maya import (
     cmds,
-    mel,
 )
 
 
@@ -37,22 +34,166 @@ if sys.version_info > (3, 0):
 
 
 ##############################################################################
-# 
+#
 ##############################################################################
+class EdgeLineDrawerConfig:
+    """Config for EdgeLineDrawer"""
+
+    def __init__(self):
+        self.settings = {
+            "soft": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 1.0},
+            "hard": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 3.0},
+            "fold": {"enabled": False, "color": (0.0, 0.0, 0.0), "width": 2.0, "fold_angle": 60.0},
+            "crease": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 3.0},
+            "border": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 6.0},
+            "boundary": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 4.0},
+        }
+
+    def get_setting(self, key):
+        # type: (Text) -> Dict[Text, Any]
+        """Get a setting by key"""
+        return self.settings.get(key, {})
+
+    def update_settings(self, key, enabled=None, color=None, width=None, fold_angle=None):
+        # type: (Text, Optional[bool], Optional[PointLike], Optional[float], Optional[float]) -> None
+        """Update a setting by key"""
+        if key in self.settings:
+            if enabled is not None:
+                self.settings[key]["enabled"] = enabled
+            if color is not None:
+                self.settings[key]["color"] = color
+            if width is not None:
+                self.settings[key]["width"] = width
+
+            if fold_angle is not None and key == "fold":
+                self.settings["fold"]["fold_angle"] = fold_angle
+
+
+class MeshEdges(object):
+    """Class to store edge line info for a mesh
+
+    Extract edge line data from Maya mesh objects and generate line information for
+    each edge type (soft, hard, fold, etc.) based on the specified settings (EdgeLineDrawerConfig).
+    """
+
+    def __init__(self, mesh, config):
+        # type: (MeshLike, EdgeLineDrawerConfig) -> None
+
+        self.mesh = get_mfnmesh_from_meshlike(mesh)
+        self.config = config
+        self.edge_lines = get_edge_lines(
+                self.mesh,
+                soft=config.get_setting("soft").get("enabled", False),
+                hard=config.get_setting("hard").get("enabled", False),
+                fold=config.get_setting("fold").get("enabled", False),
+                crease=config.get_setting("crease").get("enabled", False),
+                border=config.get_setting("border").get("enabled", False),
+                boundary=config.get_setting("boundary").get("enabled", False),
+                fold_angle=config.get_setting("fold")["fold_angle"]
+        )
+
+    def get_draw_info(self, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
+        # type: (float, float, float, float) -> Dict[Text, EdgeLineDrawInfo]
+        """Get edge line draw info for the mesh
+
+        This method converts the mesh's edge lines based on the specified UV coordinate range and
+        generates the information necessary for drawing. The edge lines can be mapped to a specific
+        UV coordinate range through the umin, vmin, umax, and vmax parameters. This ensures that
+        the edge lines are drawn accurately when only part of the mesh is displayed.
+        """
+
+        to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
+
+        result = {}
+        for key, setting in self.config.settings.items():
+            if not setting["enabled"]:
+                continue
+
+            color = setting["color"]
+            width = setting["width"]
+            lines = self.edge_lines[key]
+            if to_be_map_uv:
+                lines = [EdgeLine(
+                    line.edge_id,
+                    line.map_0_1_into_range(line.uv1, umin, umax, vmin, vmax),
+                    line.map_0_1_into_range(line.uv2, umin, umax, vmin, vmax),
+                ) for line in lines]
+
+            result[key] = EdgeLineDrawInfo(color, width, lines)
+
+        return result
+
+
+class EdgeLineDrawInfo(object):
+    """Class to store edge line info"""
+
+    def __init__(self, color, width, lines):
+        # type: (Tuple[float, float, float], float, List[EdgeLine]) -> None
+
+        self.line_color = [
+            int(color[0] * 255),
+            int(color[1] * 255),
+            int(color[2] * 255),
+            255
+        ]
+        self.line_width = width
+        self.lines = lines
+
 
 class EdgeLine(object):
 
-    def __init__(self, mesh, edge_id, from_uv, to_uv):
-        # type: (om.MFnMesh, int, Tuple[float, float], Tuple[float, float]) -> None
-        self.mesh_name = mesh.name()
+    def __init__(self, edge_id, from_uv, to_uv):
+        # type: (int, Tuple[float, float], Tuple[float, float]) -> None
         self.edge_id = edge_id
         self.uv1 = list(from_uv)
         self.uv2 = list(to_uv)
 
+    def map_0_1_into_range(self, uv, u_min, u_max, v_min, v_max):
+        # type: (Tuple[float, float]|List[float], float, float, float, float) -> Tuple[float, float]
+        """Map a UV value from 0-1 into the range of the UV set
 
+        Scenario: no change.
+            when u_min = 0.0, u_max = 1.0, v_min = 0.0, v_max = 1.0
+            then the UV value is not changed
+
+        Scenario: Wide UV range
+            when u_min = -1.0, u_max = 1.0, v_min = -1.0, v_max = 1.0
+            then the UV value is mapped into the range of 0-1
+            ex. (0.5, 0.5) -> (0.75, 0.75)
+        """
+
+        u = uv[0]
+        v = uv[1]
+
+        u_range = u_max - u_min
+        v_range = v_max - v_min
+
+        u = (u - u_min) / u_range
+        v = (v - v_min) / v_range
+
+        return u, v
+
+
+def edges_to_json_string(edges):
+    # type: (List|Dict) -> Text
+    """Convert a list or dict of edge lines to a JSON string"""
+
+    class EdgeEncoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, (EdgeLine, EdgeLineDrawInfo, MeshEdges)):
+                return o.__dict__
+            return json.JSONEncoder.default(self, o)
+
+    res = json.dumps(edges, cls=EdgeEncoder)
+
+    return res
+
+
+##############################################################################
 def get_current_uv_set_id(fn_mesh):
     # type: (om.MFnMesh) -> int
-    """ メッシュの現在のUVセットIDを取得する"""
+    """Get the index of the current UV set"""
+
     set_names = fn_mesh.getUVSetNames()
     current_set_name = fn_mesh.currentUVSetName()
     current_set_id = set_names.index(current_set_name)
@@ -62,6 +203,7 @@ def get_current_uv_set_id(fn_mesh):
 
 def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
     # type: (om.MFnMesh, om.MItMeshVertex, om.MItMeshEdge, str, Optional[int]) -> List[EdgeLine]
+    """Get the edge line of the current iterators"""
 
     if face_id is None:
         res = []
@@ -80,27 +222,34 @@ def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
     it_vert.setIndex(vert2)
     uv2 = it_vert.getUV(face_id, uv_set_name)
 
-    line = EdgeLine(fn_mesh, it_edge.index(), uv1, uv2)
+    if uv1 == uv2:
+        return []
+
+    line = EdgeLine(it_edge.index(), uv1, uv2)
 
     return [line]
 
 
 def get_edge_lines(
-        fn_mesh,
+        meshlike,
         hard=True,
         soft=False,
         border=False,
+        boundary=False,
         crease=False,
         fold=False,
         fold_angle=60.0
 ):
-    # type: (om.MFnMesh, bool, bool, bool, bool, bool, float) -> List[List[EdgeLine]]
-    """ メッシュの各種エッジラインを取得する"""
+    # type: (MeshLike, bool, bool, bool, bool, bool, bool, float) -> Dict[Text, List[EdgeLine]]
+    """Get the edge lines of the given mesh"""
 
-    result = []
+    fn_mesh = get_mfnmesh_from_meshlike(meshlike)
+
+    result = {}
     hard_edges_uvs = []
     soft_edges_uvs = []
     border_edges = []
+    boundary_edges = []
     crease_edges = []
     fold_edges_uvs = []
 
@@ -139,6 +288,10 @@ def get_edge_lines(
             lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
             soft_edges_uvs.extend(lines)
 
+        if boundary and it_edge.onBoundary():
+            lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
+            boundary_edges.extend(lines)
+
         if fold and it_edge.numConnectedFaces() >= 2:
 
             # ignore 3 or more connected faces for now.
@@ -162,35 +315,22 @@ def get_edge_lines(
 
         it_edge.next()
 
-    result.append(hard_edges_uvs)
-    result.append(soft_edges_uvs)
-    result.append(border_edges)
-    result.append(crease_edges)
-    result.append(fold_edges_uvs)
+    result["hard"] = hard_edges_uvs
+    result["soft"] = soft_edges_uvs
+    result["border"] = border_edges
+    result["boundary"] = boundary_edges
+    result["crease"] = crease_edges
+    result["fold"] = fold_edges_uvs
 
     return result
 
 
-def edges_to_json_string(edges):
-    # type: (Any) -> Text
-
-    class EdgeEncoder(json.JSONEncoder):
-        def default(self, o):
-            if isinstance(o, EdgeLine):
-                return o.__dict__
-            return json.JSONEncoder.default(self, o)
-
-    res = json.dumps(edges, cls=EdgeEncoder)
-
-    return res
-
-
-def execute_drawer(image_path, json_data):
-    # type: (Text, Text) -> None
-    """ エッジのUV座標を元にエッジラインを描画する"""
+def execute_drawer(image_path, width, height, json_data):
+    # type: (Text, int, int, Text) -> None
+    """Execute the edge_drawer.exe with the given arguments"""
 
     # if len(json_data) > 7500:  # windows cmd line length limit is 8191
-    if len(json_data) > 0:  # windows cmd line length limit is 8191
+    if len(json_data) > 1:  # windows cmd line length limit is 8191
 
         with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
             temp_file.write(json_data)
@@ -199,268 +339,20 @@ def execute_drawer(image_path, json_data):
     cmd = " ".join([
         "edge_drawer",
         image_path,
+        str(width),
+        str(height),
         json_data,
-        "-o",
-        image_path,
     ])
 
-    subprocess.call(cmd, shell=True)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # stdout = result.stdout
+    stderr = result.stderr
+    if stderr:
+        print(cmd)
+        cmds.error(stderr)
+        return
+
     subprocess.call("start " + image_path, shell=True)
-
-
-def show_ui():
-    # type: () -> None
-
-    if cmds.window("settingsWindow", exists=True):
-        cmds.deleteUI("settingsWindow", window=True)
-    
-    settingsWindow = cmds.window("settingsWindow", title="Settings")
-
-    # layout = mel.eval("""getOptionBox();""")
-    # cmds.setParent(layout)
-
-    cmds.columnLayout("snapUVcol", adjustableColumn=True, rowSpacing=10, columnAttach=("both", 10))
-    cmds.frameLayout("snapUVframe", label="Snapshot UVs Settings", collapsable=True, collapse=False)  # noqa: E501
-   
-    file_name = cmds.optionVar(q="uvSnapshotFileName")
-    cmds.textFieldButtonGrp(
-        "filenameField",
-        label="filename: ",
-        placeholderText="output path",
-        fileName=file_name,
-        adjustableColumn3=2,
-        buttonLabel="Browse...",
-        buttonCommand=textwrap.dedent("""
-            import uv_snapshot_edge_drawer as drawer
-            sd = cmds.workspace(q=True, rootDirectory=True)
-            res = cmds.fileDialog2(
-                fileMode=0,
-                caption='Select Output Path',
-                okCaption='Select',
-                dialogStyle=2,
-                startingDirectory=sd,
-                fileFilter='*.png'
-            )
-            if res:
-                cmds.optionVar(sv=('uvSnapshotFileName', res[0]))
-                cmds.textFieldButtonGrp("filenameField", edit=True, text=res[0])
-        """)
-    )
-    
-    # Size controls
-    cmds.intSliderGrp("resoX", label="Size X (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
-    cmds.intSliderGrp("resoY", label="Size Y (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
-    
-    # Checkboxes
-    # cmds.checkBoxGrp(label="", label1="Lock aspect ratio", value1=True)
-    cmds.checkBoxGrp("antialias", label="", label1="Anti-alias lines")
-    # cmds.checkBoxGrp(label1="Soft Edge", value1=False)
-    cmds.checkBoxGrp("exportHardEdge", label="", label1="Hard Edge", value1=True)
-
-    if cmds.about(apiVersion=True) >= 20230000:
-        cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=True)  # noqa: E501
-    else:
-        cmds.checkBoxGrp("exportBorderEdge", label="", label1="Border Edge", value1=False, enable=False)  # noqa: E501
-    cmds.checkBoxGrp("exportCreaseEdge", label="", label1="Crease Edge", value1=True)  # noqa: E501
-    cmds.checkBoxGrp("exportFoldEdge", label="", label1="Fold Edge", value1=False)
-
-    cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501
-    
-    # Edge Color controls
-    cmds.colorSliderGrp("softEdgeColor", label="Soft Edge Color:", rgb=(0.8, 0.8, 0.8))
-    cmds.colorSliderGrp("hardEdgeColor", label="Hard Edge Color:", rgb=(0.0, 0.75, 1.0))
-    cmds.colorSliderGrp("borderEdgeColor", label="Border Edge Color:", rgb=(1, 0, 0))
-    cmds.colorSliderGrp("creaseEdgeColor", label="Crease Edge Color:", rgb=(1, 1, 0))
-    cmds.colorSliderGrp("foldEdgeColor", label="Fold Edge Color:", rgb=(0.75, 0.75, 0))
-    cmds.separator(h=10)
-
-    # Edge Width controls
-    # cmds.intSliderGrp(label="Soft Edge Line Width:", field=True, min=1, max=100, value=3)  # noqa: E501
-    cmds.intSliderGrp("hardEdgeWidth", label="Hard Edge Line Width:", field=True, min=1, max=100, value=3)  # noqa: E501
-    cmds.intSliderGrp("borderEdgeWidth", label="Border Edge Line Width:", field=True, min=1, max=100, value=6)  # noqa: E501
-    cmds.intSliderGrp("creaseEdgeWidth", label="Crease Edge Line Width:", field=True, min=1, max=100, value=2)  # noqa: E501
-    cmds.intSliderGrp("foldEdgeWidth", label="Fold Edge Line Width:", field=True, min=1, max=100, value=2)  # noqa: E501
-    cmds.setParent("..")  # End the frameLayout
-
-    # UV Area Settings
-    cmds.frameLayout(label="UV Area Settings", collapsable=True)
-    cmds.radioButtonGrp("uvAreaType", label="UV Area:", labelArray2=["Tiles", "Range"], numberOfRadioButtons=2)  # noqa: E501
-    # cmds.floatFieldGrp(labelArray2=["U:", "V:"], numberOfFields=2, value1=1.0, value2=1.0)  # noqa: E501
-    # cmds.floatSliderGrp(label="Range", field=True, minValue=0.0, maxValue=1.0, value=0.5)  # noqa: E501
-    cmds.setParent("..")  # End the frameLayout
-
-    # Buttons at the bottom
-    cmds.button(
-        label="Take Snap Shot!",
-        command=textwrap.dedent("""
-            import uv_snapshot_edge_drawer as drawer
-            drawer.snapshot()
-        """)
-    )
-    cmds.button(label="Close", command='cmds.deleteUI("settingsWindow", window=True)')
-
-    # Show the window
-    cmds.showWindow(settingsWindow)
-
-
-def snapshot():
-    mesh = cmds.ls(sl=True, dag=True, type="mesh")
-    if not mesh:
-        cmds.warning("Select some mesh")
-        return
-
-    aa = cmds.checkBoxGrp("antialias", query=True, value1=True)
-    entire_uv_range = cmds.radioButtonGrp("uvAreaType", query=True, select=True) == 1
-    file_format = "png"
-    # uv_set_name = cmds.textFieldGrp("", query=True, text=True)
-    file_path = cmds.textFieldButtonGrp("filenameField", query=True, text=True)
-    if not file_path.endswith(".png"):
-        file_path += ".png"
-
-    overwrite = True
-    red_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)[0] * 255  # noqa: E501
-    blue_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)[1] * 255  # noqa: E501
-    green_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)[2] * 255  # noqa: E501
-    u_max = 1.0
-    u_min = 0.0
-    v_max = 1.0
-    v_min = 0.0
-    x_resolution = cmds.intSliderGrp("resoX", query=True, value=True)
-    y_resolution = cmds.intSliderGrp("resoY", query=True, value=True)
-
-    cmds.uvSnapshot(
-        antiAliased=aa,
-        entireUVRange=entire_uv_range,
-        fileFormat=file_format,
-        # uvSetName=uv_set_name,
-        name=file_path,
-        overwrite=overwrite,
-        redColor=red_color,
-        blueColor=blue_color,
-        greenColor=green_color,
-        uMax=u_max,
-        uMin=u_min,
-        vMax=v_max,
-        vMin=v_min,
-        xResolution=x_resolution,
-        yResolution=y_resolution
-    )
-
-    if not os.path.exists(file_path):
-        cmds.warning("Snapshot file not found: {}".format(file_path))
-        return
-
-    hard_edge = cmds.checkBoxGrp("exportHardEdge", query=True, value1=True)
-    border_edge = cmds.checkBoxGrp("exportBorderEdge", query=True, value1=True)
-    crease_edge = cmds.checkBoxGrp("exportCreaseEdge", query=True, value1=True)
-    fold_edge = cmds.checkBoxGrp("exportFoldEdge", query=True, value1=True)
-    fold_angle = cmds.intSliderGrp("foldAngle", query=True, value=True)
-
-    hard_edge_color = cmds.colorSliderGrp("hardEdgeColor", query=True, rgbValue=True)
-    border_edge_color = cmds.colorSliderGrp("borderEdgeColor", query=True, rgbValue=True)  # noqa: E501
-    crease_edge_color = cmds.colorSliderGrp("creaseEdgeColor", query=True, rgbValue=True)  # noqa: E501
-    fold_edge_color = cmds.colorSliderGrp("foldEdgeColor", query=True, rgbValue=True)
-
-    hard_edge_width = cmds.intSliderGrp("hardEdgeWidth", query=True, value=True)
-    border_edge_width = cmds.intSliderGrp("borderEdgeWidth", query=True, value=True)
-    crease_edge_width = cmds.intSliderGrp("creaseEdgeWidth", query=True, value=True)
-    fold_edge_width = cmds.intSliderGrp("foldEdgeWidth", query=True, value=True)
-
-    mesh_fn = get_mfnmesh_from_meshlike(mesh[0])
-    edges = get_edge_lines(
-            mesh_fn,
-            hard=hard_edge,
-            border=border_edge,
-            crease=crease_edge,
-            fold=fold_edge,
-            fold_angle=fold_angle
-    )
-
-    tmp_json = []
-    if fold_edge:
-        tmp_json.append({
-            "line_color": [
-                int(fold_edge_color[0] * 255),
-                int(fold_edge_color[1] * 255),
-                int(fold_edge_color[2] * 255),
-                255
-            ],
-            "line_width": fold_edge_width,
-            "lines": edges[4]
-        })
-    if hard_edge:
-        tmp_json.append({
-            "line_color": [
-                int(hard_edge_color[0] * 255),
-                int(hard_edge_color[1] * 255),
-                int(hard_edge_color[2] * 255),
-                255
-            ],
-            "line_width": hard_edge_width,
-            "lines": edges[0]
-        })
-    if crease_edge:
-        tmp_json.append({
-            "line_color": [
-                int(crease_edge_color[0] * 255),
-                int(crease_edge_color[1] * 255),
-                int(crease_edge_color[2] * 255),
-                255
-            ],
-            "line_width": crease_edge_width,
-            "lines": edges[3]
-        })
-    if border_edge:
-        tmp_json.append({
-            "line_color": [
-                int(border_edge_color[0] * 255),
-                int(border_edge_color[1] * 255),
-                int(border_edge_color[2] * 255),
-                255
-            ],
-            "line_width": border_edge_width,
-            "lines": edges[2]
-        })
-
-    json_data = edges_to_json_string(tmp_json)
-    execute_drawer(file_path, json_data)
-    cmds.inViewMessage(
-        amg="Exported: {}".format(file_path),
-        pos="topCenter",
-        fade=True,
-        alpha=0.9,
-        fadeStayTime=10000,
-        fadeOutTime=1000
-    )
-
-
-def foo():
-    """For debug"""
-    mesh = cmds.ls(sl=True, dag=True, type="mesh")
-    if not mesh:
-        cmds.warning("Select some mesh")
-        return
-
-    mesh_fn = get_mfnmesh_from_meshlike(mesh[0])
-    edges = get_edge_lines(mesh_fn, hard=True, fold=True)
-
-    tmp = [
-        {
-            "line_color": [255, 0, 0, 255],
-            "line_width": 10.0,
-            "lines": edges[0]
-        },
-        {
-            "line_color": [0, 255, 0, 255],
-            "line_width": 20.0,
-            "lines": edges[1]
-        }
-    ]
-
-    json_data = edges_to_json_string(tmp)
-
-    image_path = r"D:\uea.jpg"
-    execute_drawer(image_path, json_data)
 
 
 ##############################################################################
@@ -503,6 +395,35 @@ def get_mfnmesh_from_meshlike(mesh):
         raise TypeError("mesh must be MFnMesh or MDagPath")
 
     return mesh
+
+
+def foo():
+    """For debug"""
+    mesh = cmds.ls(sl=True, dag=True, type="mesh")
+    if not mesh:
+        cmds.warning("Select some mesh")
+        return
+
+    mesh_fn = get_mfnmesh_from_meshlike(mesh[0])
+    edges = get_edge_lines(mesh_fn, hard=True, fold=True)
+
+    tmp = [
+        {
+            "line_color": [255, 0, 0, 255],
+            "line_width": 10.0,
+            "lines": edges["hard"]
+        },
+        {
+            "line_color": [0, 255, 0, 255],
+            "line_width": 20.0,
+            "lines": edges["fold"]
+        }
+    ]
+
+    json_data = edges_to_json_string(tmp)
+
+    image_path = r"D:\uea.jpg"
+    execute_drawer(image_path, 256, 256, json_data)
 
 
 # show_ui()
