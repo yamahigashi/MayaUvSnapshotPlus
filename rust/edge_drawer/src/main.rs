@@ -5,6 +5,10 @@ use std::fs;
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::draw_polygon_mut;
 use imageproc::point::Point;
+use imageproc::{
+    drawing::draw_antialiased_line_segment_mut,
+    pixelops::interpolate
+};
 use std::path::Path;
 use clap::{App, Arg};
 // use serde_json::Value;
@@ -13,8 +17,9 @@ use std::path::PathBuf;
 
 struct Config {
     image_path: PathBuf,
+    width: u32,
+    height: u32,
     edges: Vec<Edges>,
-    output_path: PathBuf,
 }
 
 
@@ -54,19 +59,21 @@ fn parse_arguments() -> Config {
         .version("1.0")
         .about("Draws edges on an image based on JSON input")
         .arg(Arg::with_name("IMAGE")
-            .help("Sets the input image file path")
+            .help("Sets the output image file path")
             .required(true)
             .index(1))
+        .arg(Arg::with_name("WIDTH")
+            .help("Sets the output image width")
+            .required(true)
+            .index(2))
+        .arg(Arg::with_name("HEIGHT")
+            .help("Sets the output image height")
+            .required(true)
+            .index(3))
         .arg(Arg::with_name("EDGES")
             .help("Sets the JSON string for edge data")
             .required(true)
-            .index(2))
-        .arg(Arg::with_name("output")
-            .help("Sets the output image file path")
-            .short('o')
-            .long("output")
-            .takes_value(true)
-            .required(false))
+            .index(4))
         .get_matches();
 
     let image_path: PathBuf = matches.value_of("IMAGE").unwrap().into();
@@ -84,36 +91,15 @@ fn parse_arguments() -> Config {
         panic!("No edges data provided");
     };
 
-    let output_path = if let Some(output) = matches.value_of("output") {
-        PathBuf::from(output)
-    } else {
-        generate_output_path(&image_path)
-    };
+    let width: u32 = matches.value_of("WIDTH").unwrap().parse().unwrap();
+    let height: u32 = matches.value_of("HEIGHT").unwrap().parse().unwrap();
 
     Config {
         image_path,
+        width,
+        height,
         edges,
-        output_path,
     }
-}
-
-fn generate_output_path(image_path: &Path) -> PathBuf {
-    let mut output_path = image_path.with_file_name(
-        image_path.file_stem().unwrap().to_str().unwrap().to_owned() + "_edges"
-    );
-
-    if let Some(ext) = image_path.extension() {
-        output_path.set_extension(ext);
-    }
-
-    output_path
-}
-
-
-fn load_image(image_path: &Path) -> RgbaImage {
-    image::open(image_path)
-        .expect("Failed to load image")
-        .to_rgba8()
 }
 
 
@@ -133,7 +119,14 @@ fn draw_edges(img: &mut RgbaImage, edges: &[Edges]) {
             let p2 = (u2 as f32, v2 as f32);
 
             let color = Rgba([edge.line_color[0], edge.line_color[1], edge.line_color[2], edge.line_color[3]]);
-            draw_wide_line_segment_mut(img, p1, p2, edge.line_width, color);
+
+            if edge.line_width <= 1.0 {
+                let p1 = (u1 as i32, v1 as i32);
+                let p2 = (u2 as i32, v2 as i32);
+                imageproc::drawing::draw_antialiased_line_segment_mut(img, p1, p2, color, interpolate);
+            } else {
+                draw_wide_line_segment_mut(img, p1, p2, edge.line_width, color);
+            }
         }
     }
 }
@@ -171,10 +164,11 @@ fn save_image(img: &RgbaImage, image_path: &PathBuf) {
 
 fn main() {
     let config = parse_arguments();
-    let mut img = load_image(&config.image_path);
+    let mut img = RgbaImage::new(config.width, config.height);
     draw_edges(&mut img, &config.edges);
-    save_image(&img, &config.output_path);
+    save_image(&img, &config.image_path);
 }
+
 
 // ---------------------------------------------------------------------------
 #[cfg(test)]
