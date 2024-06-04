@@ -68,9 +68,11 @@ def show_ui():
                 okCaption='Select',
                 dialogStyle=2,
                 startingDirectory=sd,
-                fileFilter='*.png'
+                fileFilter='Image Files PNG or SVG(*.png *.svg)'
             )
             if res:
+                if not res[0].endswith(".png") and not res[0].endswith(".svg"):
+                    res[0] += ".png"
                 cmds.optionVar(sv=('uvSnapshotFileName', res[0]))
                 cmds.textFieldButtonGrp("filenameField", edit=True, text=res[0])
         """)
@@ -199,9 +201,49 @@ def show_ui():
     )
     cmds.button(label="Close", command='cmds.deleteUI("settingsWindow", window=True)')
 
+    # Attach the update_controls function to the checkboxes
+    cmds.checkBoxGrp("exportSoftEdge", edit=True, changeCommand=update_controls)
+    cmds.checkBoxGrp("exportHardEdge", edit=True, changeCommand=update_controls)
+    cmds.checkBoxGrp("exportBorderEdge", edit=True, changeCommand=update_controls)
+    cmds.checkBoxGrp("exportBoundaryEdge", edit=True, changeCommand=update_controls)
+    cmds.checkBoxGrp("exportCreaseEdge", edit=True, changeCommand=update_controls)
+    cmds.checkBoxGrp("exportFoldEdge", edit=True, changeCommand=update_controls)
+
+    # Call update_controls initially to set the correct states
+    update_controls()
+
     # Show the window
     uv_snapchot_ctrl_changed()
     cmds.showWindow(settingsWindow)
+
+
+def update_controls(*args):
+    # Get the states of the checkboxes
+    soft_edge_state = cmds.checkBoxGrp("exportSoftEdge", query=True, value1=True)
+    hard_edge_state = cmds.checkBoxGrp("exportHardEdge", query=True, value1=True)
+    border_edge_state = cmds.checkBoxGrp("exportBorderEdge", query=True, value1=True)
+    boundary_edge_state = cmds.checkBoxGrp("exportBoundaryEdge", query=True, value1=True)
+    crease_edge_state = cmds.checkBoxGrp("exportCreaseEdge", query=True, value1=True)
+    fold_edge_state = cmds.checkBoxGrp("exportFoldEdge", query=True, value1=True)
+
+    # Enable or disable the color and width controls based on the checkbox states
+    cmds.colorSliderGrp("softEdgeColor", edit=True, visible=soft_edge_state)
+    cmds.intSliderGrp("softEdgeWidth", edit=True, visible=soft_edge_state)
+    
+    cmds.colorSliderGrp("hardEdgeColor", edit=True, visible=hard_edge_state)
+    cmds.intSliderGrp("hardEdgeWidth", edit=True, visible=hard_edge_state)
+    
+    cmds.colorSliderGrp("borderEdgeColor", edit=True, visible=border_edge_state)
+    cmds.intSliderGrp("borderEdgeWidth", edit=True, visible=border_edge_state)
+    
+    cmds.colorSliderGrp("boundaryEdgeColor", edit=True, visible=boundary_edge_state)
+    cmds.intSliderGrp("boundaryEdgeWidth", edit=True, visible=boundary_edge_state)
+    
+    cmds.colorSliderGrp("creaseEdgeColor", edit=True, visible=crease_edge_state)
+    cmds.intSliderGrp("creaseEdgeWidth", edit=True, visible=crease_edge_state)
+    
+    cmds.colorSliderGrp("foldEdgeColor", edit=True, visible=fold_edge_state)
+    cmds.intSliderGrp("foldEdgeWidth", edit=True, visible=fold_edge_state)
 
 
 def get_uv_min_max():
@@ -237,8 +279,6 @@ def uv_snapchot_ctrl_changed(*args):
 
 def snapshot():
     file_path = cmds.textFieldButtonGrp("filenameField", query=True, text=True)
-    if not file_path.endswith(".png"):
-        file_path += ".png"
 
     x_resolution = cmds.intSliderGrp("resoX", query=True, value=True)
     y_resolution = cmds.intSliderGrp("resoY", query=True, value=True)

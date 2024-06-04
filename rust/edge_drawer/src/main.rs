@@ -6,14 +6,16 @@ use image::{Rgba, RgbaImage};
 use imageproc::drawing::draw_polygon_mut;
 use imageproc::point::Point;
 use imageproc::{
-    drawing::draw_antialiased_line_segment_mut,
+    // drawing::draw_antialiased_line_segment_mut,
     pixelops::interpolate
 };
-use std::path::Path;
 use clap::{App, Arg};
-// use serde_json::Value;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+// use usvg::{Tree, Options};
+use svg::node::element::path::{Data};
+use svg::node::element::{Path as SvgPath, Line};
+use svg::Document;
 
 struct Config {
     image_path: PathBuf,
@@ -103,6 +105,41 @@ fn parse_arguments() -> Config {
 }
 
 
+fn draw_edges_svg(edges: &[Edges], width: u32, height: u32) -> Document {
+    let mut document = Document::new()
+        .set("viewBox", (0, 0, width, height));
+
+    for edge in edges {
+        for line in edge.lines.iter() {
+            let u1 = line.uv1[0] * width as f32;
+            let v1 = (1.0 - line.uv1[1]) * height as f32;
+            let u2 = line.uv2[0] * width as f32;
+            let v2 = (1.0 - line.uv2[1]) * height as f32;
+
+            let data = Data::new()
+                .move_to((u1 as f64, v1 as f64))
+                .line_to((u2 as f64, v2 as f64));
+
+            let color = format!("rgb({}, {}, {})",
+                edge.line_color[0],
+                edge.line_color[1],
+                edge.line_color[2]);
+
+            let path = SvgPath::new()
+                .set("fill", "none")
+                .set("stroke", color)
+                .set("stroke-width", edge.line_width)
+                .set("stroke-linecap", "round")
+                .set("d", data);
+
+            document = document.add(path);
+        }
+    }
+
+    document
+}
+
+
 fn draw_edges(img: &mut RgbaImage, edges: &[Edges]) {
 
     for edge in edges {
@@ -162,11 +199,21 @@ fn save_image(img: &RgbaImage, image_path: &PathBuf) {
 }
 
 
+fn save_svg(document: &Document, image_path: &PathBuf) {
+    svg::save(image_path, document).expect("Failed to save SVG");
+}
+
+
 fn main() {
     let config = parse_arguments();
-    let mut img = RgbaImage::new(config.width, config.height);
-    draw_edges(&mut img, &config.edges);
-    save_image(&img, &config.image_path);
+    if config.image_path.extension().and_then(|s| s.to_str()) == Some("svg") {
+        let document = draw_edges_svg(&config.edges, config.width, config.height);
+        save_svg(&document, &config.image_path);
+    } else {
+        let mut img = RgbaImage::new(config.width, config.height);
+        draw_edges(&mut img, &config.edges);
+        save_image(&img, &config.image_path);
+    }
 }
 
 
