@@ -128,7 +128,11 @@ class AsyncPreviewController(object):
         self._pending_request = request
         if missing_meshes:
             self._warmup_sessions = [
-                drawer.start_mesh_topology_build_session(mesh_name)
+                drawer.start_mesh_topology_build_session(
+                    mesh_name,
+                    include_edges=request["needs_edge_data"],
+                    include_polygons=True,
+                )
                 for mesh_name in missing_meshes
             ]
             _set_preview_busy("Warming cache...")
@@ -190,9 +194,19 @@ class AsyncPreviewController(object):
 
         snapshots = []
         for mesh_name in self._pending_request["mesh_names"]:
-            snapshot = drawer.get_cached_mesh_topology_snapshot(mesh_name)
+            snapshot = drawer.get_cached_mesh_topology_snapshot(
+                mesh_name,
+                include_edges=self._pending_request["needs_edge_data"],
+                include_polygons=True,
+            )
             if snapshot is None:
-                self._warmup_sessions = [drawer.start_mesh_topology_build_session(mesh_name)]
+                self._warmup_sessions = [
+                    drawer.start_mesh_topology_build_session(
+                        mesh_name,
+                        include_edges=self._pending_request["needs_edge_data"],
+                        include_polygons=True,
+                    )
+                ]
                 _set_preview_busy("Warming cache...")
                 return
             snapshots.append(snapshot)
@@ -309,19 +323,16 @@ def _get_uv_face_polygons(mesh_name, u_min, u_max, v_min, v_max):
 
     while not it_face.isDone():
         us, vs = it_face.getUVs(uv_set_name)
-        points = []
-        for u, v in zip(us, vs):
-            point = (u, v)
-            if to_be_map_uv:
-                point = drawer.map_uv_into_range(point, u_min, u_max, v_min, v_max)
-            points.append(point)
-
-        deduped = []
-        for point in points:
-            if not deduped or deduped[-1] != point:
-                deduped.append(point)
-        if len(deduped) >= 3 and deduped[0] == deduped[-1]:
-            deduped.pop()
+        if to_be_map_uv:
+            mapped_us = []
+            mapped_vs = []
+            for u, v in zip(us, vs):
+                mapped_u, mapped_v = drawer.map_uv_into_range((u, v), u_min, u_max, v_min, v_max)
+                mapped_us.append(mapped_u)
+                mapped_vs.append(mapped_v)
+            deduped = drawer.dedupe_uv_points(mapped_us, mapped_vs)
+        else:
+            deduped = drawer.dedupe_uv_points(us, vs)
         if len(deduped) >= 3:
             if hasattr(drawer, "UVPolygon"):
                 polygons.append(drawer.UVPolygon(deduped))
@@ -630,6 +641,14 @@ def _collect_snapshot_settings():
     }
 
 
+def _settings_need_edge_data(settings):
+    # type: (Dict[Text, Any]) -> bool
+    for edge_key in ("soft", "hard", "border", "boundary", "crease", "fold"):
+        if settings["{}_draw_internal".format(edge_key)] or settings["{}_draw_outline".format(edge_key)]:
+            return True
+    return False
+
+
 def _build_drawer_config(settings, width_scale=1.0):
     # type: (Dict[Text, Any], float) -> drawer.EdgeLineDrawerConfig
     config = drawer.EdgeLineDrawerConfig()
@@ -714,16 +733,18 @@ def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     # type: (Dict[Text, Any], List[Any], float) -> Any
     started_at = time.time()
     config = _build_drawer_config(settings, width_scale=width_scale)
+    needs_edge_data = _settings_need_edge_data(settings)
     u_min, u_max, v_min, v_max = settings["uv_min_max"]
     tmp_json = []
     tmp_polygons = []
     draw_info_elapsed = 0.0
     polygons_elapsed = 0.0
     for snapshot in snapshots:
-        phase_started = time.perf_counter()
-        draw_info = snapshot.get_draw_info(config, u_min, u_max, v_min, v_max)
-        draw_info_elapsed += time.perf_counter() - phase_started
-        tmp_json.extend(list(draw_info.values()))
+        if needs_edge_data:
+            phase_started = time.perf_counter()
+            draw_info = snapshot.get_draw_info(config, u_min, u_max, v_min, v_max)
+            draw_info_elapsed += time.perf_counter() - phase_started
+            tmp_json.extend(list(draw_info.values()))
         phase_started = time.perf_counter()
         tmp_polygons.extend(snapshot.get_polygons(u_min, u_max, v_min, v_max))
         polygons_elapsed += time.perf_counter() - phase_started
@@ -760,7 +781,15 @@ def _build_snapshot_json(settings, width_scale=1.0):
         return None, "Select a mesh to preview"
 
     phase_started = time.perf_counter()
-    snapshots = [drawer.get_mesh_topology_snapshot(mesh_name) for mesh_name in mesh_names]
+    needs_edge_data = _settings_need_edge_data(settings)
+    snapshots = [
+        drawer.get_mesh_topology_snapshot(
+            mesh_name,
+            include_edges=needs_edge_data,
+            include_polygons=True,
+        )
+        for mesh_name in mesh_names
+    ]
     snapshot_elapsed = time.perf_counter() - phase_started
     payload_data = _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale)
     if hasattr(payload_data, "__dict__"):
@@ -789,10 +818,15 @@ def _capture_preview_request(generation):
 
     preview_width, preview_height = _get_preview_dimensions(settings)
     width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
+    needs_edge_data = _settings_need_edge_data(settings)
     snapshots = []
     missing_meshes = []
     for mesh_name in mesh_names:
-        snapshot = drawer.get_cached_mesh_topology_snapshot(mesh_name)
+        snapshot = drawer.get_cached_mesh_topology_snapshot(
+            mesh_name,
+            include_edges=needs_edge_data,
+            include_polygons=True,
+        )
         if snapshot is None:
             missing_meshes.append(mesh_name)
         else:
@@ -802,6 +836,7 @@ def _capture_preview_request(generation):
         "generation": generation,
         "settings": settings,
         "mesh_names": mesh_names,
+        "needs_edge_data": needs_edge_data,
         "snapshots": snapshots if not missing_meshes else [],
         "preview_width": preview_width,
         "preview_height": preview_height,

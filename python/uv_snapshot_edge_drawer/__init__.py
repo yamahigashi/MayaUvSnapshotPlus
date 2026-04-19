@@ -110,17 +110,29 @@ class FoldCandidate(object):
 class MeshTopologySnapshot(object):
     """Cacheable topology-derived UV data for a mesh and UV set."""
 
-    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons, build_profile=None):
-        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon], Optional[Dict[Text, float]]) -> None
+    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons, build_profile=None, has_edge_data=True, has_polygon_data=True):
+        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon], Optional[Dict[Text, float]], bool, bool) -> None
         self.mesh_name = mesh_name
         self.uv_set_name = uv_set_name
         self.edge_lines = edge_lines
         self.fold_candidates = fold_candidates
         self.polygons = polygons
         self.build_profile = dict(build_profile or {})
+        self.has_edge_data = bool(has_edge_data)
+        self.has_polygon_data = bool(has_polygon_data)
 
     def get_edge_lines(self, fold_angle):
         # type: (float) -> Dict[Text, List[EdgeLine]]
+        if not self.has_edge_data:
+            return {
+                "hard": [],
+                "soft": [],
+                "border": [],
+                "boundary": [],
+                "crease": [],
+                "fold": [],
+            }
+
         result = {}
         for key, lines in self.edge_lines.items():
             result[key] = list(lines)
@@ -135,6 +147,9 @@ class MeshTopologySnapshot(object):
 
     def get_polygons(self, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
         # type: (float, float, float, float) -> List[UVPolygon]
+        if not self.has_polygon_data:
+            return []
+
         to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
         if not to_be_map_uv:
             return self.polygons
@@ -189,10 +204,16 @@ class MeshTopologySnapshot(object):
 class MeshTopologyBuildSession(object):
     """Incrementally build topology cache on the Maya main thread."""
 
-    def __init__(self, meshlike):
-        # type: (MeshLike) -> None
+    def __init__(self, meshlike, include_edges=True, include_polygons=True):
+        # type: (MeshLike, bool, bool) -> None
         self.fn_mesh = get_mfnmesh_from_meshlike(meshlike)
-        self.cache_key = _get_mesh_cache_key(self.fn_mesh)
+        self.include_edges = bool(include_edges)
+        self.include_polygons = bool(include_polygons)
+        self.cache_key = _get_mesh_cache_key(
+            self.fn_mesh,
+            include_edges=self.include_edges,
+            include_polygons=self.include_polygons,
+        )
         self.mesh_name = self.fn_mesh.fullPathName()
         self.started_at = time.time()
         self.done = False
@@ -211,7 +232,12 @@ class MeshTopologyBuildSession(object):
         self.crease_edges = []
         self.fold_candidates = []
         self.polygons = []
-        self.phase = "crease"
+        if self.include_edges:
+            self.phase = "crease"
+        elif self.include_polygons:
+            self.phase = "faces"
+        else:
+            self.phase = "finalize"
         self.phase_timings = {
             "crease": 0.0,
             "border": 0.0,
@@ -221,20 +247,24 @@ class MeshTopologyBuildSession(object):
         }
         self.crease_index = 0
         self.border_index = 0
-        self.it_vert = om.MItMeshVertex(self.fn_mesh.object())
-        self.it_edge = om.MItMeshEdge(self.fn_mesh.object())
-        self.it_face_normals = om.MItMeshPolygon(self.fn_mesh.object())
-        self.it_face_polygons = om.MItMeshPolygon(self.fn_mesh.object())
+        self.it_vert = om.MItMeshVertex(self.fn_mesh.object()) if self.include_edges else None
+        self.it_edge = om.MItMeshEdge(self.fn_mesh.object()) if self.include_edges else None
+        self.it_face_normals = om.MItMeshPolygon(self.fn_mesh.object()) if self.include_edges else None
+        self.it_face_polygons = om.MItMeshPolygon(self.fn_mesh.object()) if self.include_polygons else None
 
-        try:
-            crease_ids, _ = self.fn_mesh.getCreaseEdges()
-            self.crease_ids = list(crease_ids)
-        except RuntimeError:
-            self.crease_ids = []
+        if self.include_edges:
+            try:
+                crease_ids, _ = self.fn_mesh.getCreaseEdges()
+                self.crease_ids = list(crease_ids)
+            except RuntimeError:
+                self.crease_ids = []
 
-        if cmds.about(apiVersion=True) >= 20230000:
-            self.border_ids = list(self.fn_mesh.getUVBorderEdges(self.current_uv_set_id))
+            if cmds.about(apiVersion=True) >= 20230000:
+                self.border_ids = list(self.fn_mesh.getUVBorderEdges(self.current_uv_set_id))
+            else:
+                self.border_ids = []
         else:
+            self.crease_ids = []
             self.border_ids = []
 
     def step(self, max_items=TOPOLOGY_WARMUP_BATCH_ITEMS, max_ms=TOPOLOGY_WARMUP_BUDGET_MS):
@@ -329,16 +359,7 @@ class MeshTopologyBuildSession(object):
                     continue
 
                 us, vs = self.it_face_polygons.getUVs(self.uv_set_name)
-                points = []
-                for u, v in zip(us, vs):
-                    points.append((u, v))
-
-                deduped = []
-                for point in points:
-                    if not deduped or deduped[-1] != point:
-                        deduped.append(point)
-                if len(deduped) >= 3 and deduped[0] == deduped[-1]:
-                    deduped.pop()
+                deduped = dedupe_uv_points(us, vs)
                 if len(deduped) >= 3:
                     self.polygons.append(UVPolygon(deduped))
 
@@ -372,6 +393,8 @@ class MeshTopologyBuildSession(object):
             self.fold_candidates,
             self.polygons,
             build_profile=self.phase_timings,
+            has_edge_data=self.include_edges,
+            has_polygon_data=self.include_polygons,
         )
         _MESH_TOPOLOGY_CACHE[self.cache_key] = snapshot
         _register_mesh_dirty_callback(self.fn_mesh)
@@ -586,6 +609,20 @@ def map_uv_into_range(uv, u_min, u_max, v_min, v_max):
     v = (v - v_min) / v_range
 
     return u, v
+
+
+def dedupe_uv_points(us, vs):
+    # type: (Iterable[float], Iterable[float]) -> List[Tuple[float, float]]
+    deduped = []
+    previous = None
+    for u, v in zip(us, vs):
+        point = (u, v)
+        if previous != point:
+            deduped.append(point)
+            previous = point
+    if len(deduped) >= 3 and deduped[0] == deduped[-1]:
+        deduped.pop()
+    return deduped
 
 
 def edges_to_json_string(edges):
@@ -814,9 +851,14 @@ def get_edge_lines(
     return result
 
 
-def _get_mesh_cache_key(fn_mesh):
-    # type: (om.MFnMesh) -> Tuple[Text, Text]
-    return fn_mesh.fullPathName(), fn_mesh.currentUVSetName()
+def _get_mesh_cache_key(fn_mesh, include_edges=True, include_polygons=True):
+    # type: (om.MFnMesh, bool, bool) -> Tuple[Text, Text, bool, bool]
+    return (
+        fn_mesh.fullPathName(),
+        fn_mesh.currentUVSetName(),
+        bool(include_edges),
+        bool(include_polygons),
+    )
 
 
 def _invalidate_mesh_topology_cache(mesh_name):
@@ -826,10 +868,16 @@ def _invalidate_mesh_topology_cache(mesh_name):
         _MESH_TOPOLOGY_CACHE.pop(key, None)
 
 
-def get_cached_mesh_topology_snapshot(meshlike):
-    # type: (MeshLike) -> Optional[MeshTopologySnapshot]
+def get_cached_mesh_topology_snapshot(meshlike, include_edges=True, include_polygons=True):
+    # type: (MeshLike, bool, bool) -> Optional[MeshTopologySnapshot]
     fn_mesh = get_mfnmesh_from_meshlike(meshlike)
-    return _MESH_TOPOLOGY_CACHE.get(_get_mesh_cache_key(fn_mesh))
+    return _MESH_TOPOLOGY_CACHE.get(
+        _get_mesh_cache_key(
+            fn_mesh,
+            include_edges=include_edges,
+            include_polygons=include_polygons,
+        )
+    )
 
 
 def _register_mesh_dirty_callback(fn_mesh):
@@ -856,19 +904,31 @@ def clear_mesh_topology_cache():
     _MESH_TOPOLOGY_CACHE.clear()
 
 
-def start_mesh_topology_build_session(meshlike):
-    # type: (MeshLike) -> MeshTopologyBuildSession
-    return MeshTopologyBuildSession(meshlike)
+def start_mesh_topology_build_session(meshlike, include_edges=True, include_polygons=True):
+    # type: (MeshLike, bool, bool) -> MeshTopologyBuildSession
+    return MeshTopologyBuildSession(
+        meshlike,
+        include_edges=include_edges,
+        include_polygons=include_polygons,
+    )
 
 
-def get_mesh_topology_snapshot(meshlike):
-    # type: (MeshLike) -> MeshTopologySnapshot
+def get_mesh_topology_snapshot(meshlike, include_edges=True, include_polygons=True):
+    # type: (MeshLike, bool, bool) -> MeshTopologySnapshot
     fn_mesh = get_mfnmesh_from_meshlike(meshlike)
-    cache_key = _get_mesh_cache_key(fn_mesh)
+    cache_key = _get_mesh_cache_key(
+        fn_mesh,
+        include_edges=include_edges,
+        include_polygons=include_polygons,
+    )
     cached = _MESH_TOPOLOGY_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    session = start_mesh_topology_build_session(fn_mesh)
+    session = start_mesh_topology_build_session(
+        fn_mesh,
+        include_edges=include_edges,
+        include_polygons=include_polygons,
+    )
     while not session.step(max_items=TOPOLOGY_WARMUP_BATCH_ITEMS, max_ms=TOPOLOGY_WARMUP_BUDGET_MS):
         pass
     return _MESH_TOPOLOGY_CACHE[cache_key]
@@ -876,7 +936,11 @@ def get_mesh_topology_snapshot(meshlike):
 
 def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
     # type: (MeshLike, float, float, float, float) -> List[UVPolygon]
-    return get_mesh_topology_snapshot(meshlike).get_polygons(umin, umax, vmin, vmax)
+    return get_mesh_topology_snapshot(
+        meshlike,
+        include_edges=False,
+        include_polygons=True,
+    ).get_polygons(umin, umax, vmin, vmax)
 
 
 def render_payload_to_path(image_path, width, height, payload_data):
