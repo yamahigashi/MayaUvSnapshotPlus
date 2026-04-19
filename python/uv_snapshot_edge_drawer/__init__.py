@@ -42,12 +42,12 @@ class EdgeLineDrawerConfig:
 
     def __init__(self):
         self.settings = {
-            "soft": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 1.0},
-            "hard": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 3.0},
-            "fold": {"enabled": False, "color": (0.0, 0.0, 0.0), "width": 2.0, "fold_angle": 60.0},
-            "crease": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 3.0},
-            "border": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 6.0},
-            "boundary": {"enabled": True, "color": (0.0, 0.0, 0.0), "width": 4.0},
+            "soft": {"draw_outline": True, "draw_internal": True, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 1.0, "outline_width": 1.0},
+            "hard": {"draw_outline": True, "draw_internal": True, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 3.0, "outline_width": 3.0},
+            "fold": {"draw_outline": False, "draw_internal": False, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 2.0, "outline_width": 2.0, "fold_angle": 60.0},
+            "crease": {"draw_outline": True, "draw_internal": True, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 3.0, "outline_width": 3.0},
+            "border": {"draw_outline": True, "draw_internal": True, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 6.0, "outline_width": 6.0},
+            "boundary": {"draw_outline": True, "draw_internal": True, "internal_color": (0.0, 0.0, 0.0), "outline_color": (0.0, 0.0, 0.0), "internal_width": 4.0, "outline_width": 4.0},
         }
 
     def get_setting(self, key):
@@ -55,16 +55,28 @@ class EdgeLineDrawerConfig:
         """Get a setting by key"""
         return self.settings.get(key, {})
 
-    def update_settings(self, key, enabled=None, color=None, width=None, fold_angle=None):
-        # type: (Text, Optional[bool], Optional[PointLike], Optional[float], Optional[float]) -> None
+    def update_settings(self, key, draw_outline=None, draw_internal=None, color=None, internal_color=None, outline_color=None, width=None, internal_width=None, outline_width=None, fold_angle=None):
+        # type: (Text, Optional[bool], Optional[bool], Optional[PointLike], Optional[PointLike], Optional[PointLike], Optional[float], Optional[float], Optional[float], Optional[float]) -> None
         """Update a setting by key"""
         if key in self.settings:
-            if enabled is not None:
-                self.settings[key]["enabled"] = enabled
+            if draw_outline is not None:
+                self.settings[key]["draw_outline"] = draw_outline
+            if draw_internal is not None:
+                self.settings[key]["draw_internal"] = draw_internal
             if color is not None:
-                self.settings[key]["color"] = color
+                self.settings[key]["internal_color"] = color
+                self.settings[key]["outline_color"] = color
+            if internal_color is not None:
+                self.settings[key]["internal_color"] = internal_color
+            if outline_color is not None:
+                self.settings[key]["outline_color"] = outline_color
             if width is not None:
-                self.settings[key]["width"] = width
+                self.settings[key]["internal_width"] = width
+                self.settings[key]["outline_width"] = width
+            if internal_width is not None:
+                self.settings[key]["internal_width"] = internal_width
+            if outline_width is not None:
+                self.settings[key]["outline_width"] = outline_width
 
             if fold_angle is not None and key == "fold":
                 self.settings["fold"]["fold_angle"] = fold_angle
@@ -84,12 +96,12 @@ class MeshEdges(object):
         self.config = config
         self.edge_lines = get_edge_lines(
                 self.mesh,
-                soft=config.get_setting("soft").get("enabled", False),
-                hard=config.get_setting("hard").get("enabled", False),
-                fold=config.get_setting("fold").get("enabled", False),
-                crease=config.get_setting("crease").get("enabled", False),
-                border=config.get_setting("border").get("enabled", False),
-                boundary=config.get_setting("boundary").get("enabled", False),
+                soft=_should_draw_edge_type(config, "soft"),
+                hard=_should_draw_edge_type(config, "hard"),
+                fold=_should_draw_edge_type(config, "fold"),
+                crease=_should_draw_edge_type(config, "crease"),
+                border=_should_draw_edge_type(config, "border"),
+                boundary=_should_draw_edge_type(config, "boundary"),
                 fold_angle=config.get_setting("fold")["fold_angle"]
         )
 
@@ -107,11 +119,13 @@ class MeshEdges(object):
 
         result = {}
         for key, setting in self.config.settings.items():
-            if not setting["enabled"]:
+            if not (setting["draw_outline"] or setting["draw_internal"]):
                 continue
 
-            color = setting["color"]
-            width = setting["width"]
+            internal_color = setting["internal_color"]
+            outline_color = setting["outline_color"]
+            internal_width = setting["internal_width"]
+            outline_width = setting["outline_width"]
             lines = self.edge_lines[key]
             if to_be_map_uv:
                 lines = [EdgeLine(
@@ -120,7 +134,15 @@ class MeshEdges(object):
                     line.map_0_1_into_range(line.uv2, umin, umax, vmin, vmax),
                 ) for line in lines]
 
-            result[key] = EdgeLineDrawInfo(color, width, lines)
+            result[key] = EdgeLineDrawInfo(
+                internal_color,
+                outline_color,
+                internal_width,
+                outline_width,
+                lines,
+                draw_outline=setting.get("draw_outline", True),
+                draw_internal=setting.get("draw_internal", True),
+            )
 
         return result
 
@@ -128,17 +150,40 @@ class MeshEdges(object):
 class EdgeLineDrawInfo(object):
     """Class to store edge line info"""
 
-    def __init__(self, color, width, lines):
-        # type: (Tuple[float, float, float], float, List[EdgeLine]) -> None
+    def __init__(self, internal_color, outline_color, internal_width, outline_width, lines, draw_outline=True, draw_internal=True):
+        # type: (Tuple[float, float, float], Tuple[float, float, float], float, float, List[EdgeLine], bool, bool) -> None
 
-        self.line_color = [
-            int(color[0] * 255),
-            int(color[1] * 255),
-            int(color[2] * 255),
+        self.internal_color = [
+            int(internal_color[0] * 255),
+            int(internal_color[1] * 255),
+            int(internal_color[2] * 255),
             255
         ]
-        self.line_width = width
+        self.outline_color = [
+            int(outline_color[0] * 255),
+            int(outline_color[1] * 255),
+            int(outline_color[2] * 255),
+            255
+        ]
+        self.internal_width = internal_width
+        self.outline_width = outline_width
+        self.draw_outline = draw_outline
+        self.draw_internal = draw_internal
         self.lines = lines
+
+
+class UVPolygon(object):
+    """UV face polygon for classification"""
+
+    def __init__(self, points):
+        # type: (List[Tuple[float, float]]) -> None
+        self.points = [list(point) for point in points]
+
+
+def _should_draw_edge_type(config, key):
+    # type: (EdgeLineDrawerConfig, Text) -> bool
+    setting = config.get_setting(key)
+    return bool(setting.get("draw_outline") or setting.get("draw_internal"))
 
 
 class EdgeLine(object):
@@ -175,13 +220,27 @@ class EdgeLine(object):
         return u, v
 
 
+def map_uv_into_range(uv, u_min, u_max, v_min, v_max):
+    # type: (Tuple[float, float]|List[float], float, float, float, float) -> Tuple[float, float]
+    u = uv[0]
+    v = uv[1]
+
+    u_range = u_max - u_min
+    v_range = v_max - v_min
+
+    u = (u - u_min) / u_range
+    v = (v - v_min) / v_range
+
+    return u, v
+
+
 def edges_to_json_string(edges):
     # type: (List|Dict) -> Text
     """Convert a list or dict of edge lines to a JSON string"""
 
     class EdgeEncoder(json.JSONEncoder):
         def default(self, o):
-            if isinstance(o, (EdgeLine, EdgeLineDrawInfo, MeshEdges)):
+            if isinstance(o, (EdgeLine, EdgeLineDrawInfo, MeshEdges, UVPolygon)):
                 return o.__dict__
             return json.JSONEncoder.default(self, o)
 
@@ -326,8 +385,40 @@ def get_edge_lines(
     return result
 
 
-def execute_drawer(image_path, width, height, json_data):
-    # type: (Text, int, int, Text) -> None
+def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
+    # type: (MeshLike, float, float, float, float) -> List[UVPolygon]
+    fn_mesh = get_mfnmesh_from_meshlike(meshlike)
+    uv_set_name = fn_mesh.currentUVSetName()
+    it_face = om.MItMeshPolygon(fn_mesh.object())
+
+    to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
+    polygons = []
+
+    while not it_face.isDone():
+        us, vs = it_face.getUVs(uv_set_name)
+        points = []
+        for u, v in zip(us, vs):
+            point = (u, v)
+            if to_be_map_uv:
+                point = map_uv_into_range(point, umin, umax, vmin, vmax)
+            points.append(point)
+
+        deduped = []
+        for point in points:
+            if not deduped or deduped[-1] != point:
+                deduped.append(point)
+        if len(deduped) >= 3 and deduped[0] == deduped[-1]:
+            deduped.pop()
+        if len(deduped) >= 3:
+            polygons.append(UVPolygon(deduped))
+
+        it_face.next()
+
+    return polygons
+
+
+def execute_drawer(image_path, width, height, json_data, open_after_save=True):
+    # type: (Text, int, int, Text, bool) -> None
     """Execute the native drawer when available, otherwise fallback to edge_drawer.exe"""
 
     image_path = _normalize_output_path(image_path)
@@ -342,7 +433,8 @@ def execute_drawer(image_path, width, height, json_data):
     else:
         _execute_drawer_cli(image_path, width, height, json_data)
 
-    subprocess.call("start " + image_path, shell=True)
+    if open_after_save:
+        subprocess.call("start " + image_path, shell=True)
 
 
 def _normalize_output_path(image_path):
