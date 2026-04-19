@@ -736,23 +736,39 @@ def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     needs_edge_data = _settings_need_edge_data(settings)
     u_min, u_max, v_min, v_max = settings["uv_min_max"]
     tmp_json = []
-    tmp_polygons = []
+    polygon_offsets = None
+    polygon_points = None
     draw_info_elapsed = 0.0
     polygons_elapsed = 0.0
-    for snapshot in snapshots:
+    for snapshot_index, snapshot in enumerate(snapshots):
         if needs_edge_data:
             phase_started = time.perf_counter()
             draw_info = snapshot.get_draw_info(config, u_min, u_max, v_min, v_max)
             draw_info_elapsed += time.perf_counter() - phase_started
             tmp_json.extend(list(draw_info.values()))
         phase_started = time.perf_counter()
-        tmp_polygons.extend(snapshot.get_polygons(u_min, u_max, v_min, v_max))
+        snapshot_polygon_offsets, snapshot_polygon_points = snapshot.get_polygon_buffers(u_min, u_max, v_min, v_max)
+        if snapshot_index == 0:
+            polygon_offsets = snapshot_polygon_offsets
+            polygon_points = snapshot_polygon_points
+        else:
+            if snapshot_index == 1:
+                polygon_offsets = list(polygon_offsets)
+                polygon_points = list(polygon_points)
+            base_point_count = polygon_offsets[-1]
+            polygon_offsets.extend(base_point_count + offset for offset in snapshot_polygon_offsets[1:])
+            polygon_points.extend(snapshot_polygon_points)
         polygons_elapsed += time.perf_counter() - phase_started
+
+    if polygon_offsets is None:
+        polygon_offsets = [0]
+        polygon_points = []
 
     padding_warning = _build_padding_warning_settings(settings, width_scale=width_scale)
     payload = {
         "edges": tmp_json,
-        "polygons": tmp_polygons,
+        "polygon_offsets": polygon_offsets,
+        "polygon_points": polygon_points,
     }
     if padding_warning is not None:
         payload["padding_warning"] = padding_warning

@@ -110,16 +110,28 @@ class FoldCandidate(object):
 class MeshTopologySnapshot(object):
     """Cacheable topology-derived UV data for a mesh and UV set."""
 
-    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons, build_profile=None, has_edge_data=True, has_polygon_data=True):
-        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon], Optional[Dict[Text, float]], bool, bool) -> None
+    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons=None, polygon_offsets=None, polygon_points=None, build_profile=None, has_edge_data=True, has_polygon_data=True):
+        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], Optional[List[UVPolygon]], Optional[List[int]], Optional[List[float]], Optional[Dict[Text, float]], bool, bool) -> None
         self.mesh_name = mesh_name
         self.uv_set_name = uv_set_name
         self.edge_lines = edge_lines
         self.fold_candidates = fold_candidates
         self.polygons = polygons
+        if polygon_offsets is None:
+            polygon_offsets = _polygon_offsets_from_polygons(polygons or [])
+        if polygon_points is None:
+            polygon_points = _polygon_points_from_polygons(polygons or [])
+        self.polygon_offsets = list(polygon_offsets)
+        self.polygon_points = list(polygon_points)
         self.build_profile = dict(build_profile or {})
         self.has_edge_data = bool(has_edge_data)
         self.has_polygon_data = bool(has_polygon_data)
+
+    def _ensure_polygons(self):
+        # type: () -> List[UVPolygon]
+        if self.polygons is None:
+            self.polygons = _polygons_from_flat_buffers(self.polygon_offsets, self.polygon_points)
+        return self.polygons
 
     def get_edge_lines(self, fold_angle):
         # type: (float) -> Dict[Text, List[EdgeLine]]
@@ -152,10 +164,10 @@ class MeshTopologySnapshot(object):
 
         to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
         if not to_be_map_uv:
-            return self.polygons
+            return self._ensure_polygons()
 
         mapped = []
-        for polygon in self.polygons:
+        for polygon in self._ensure_polygons():
             mapped.append(
                 UVPolygon(
                     [
@@ -165,6 +177,27 @@ class MeshTopologySnapshot(object):
                 )
             )
         return mapped
+
+    def get_polygon_buffers(self, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
+        # type: (float, float, float, float) -> Tuple[List[int], List[float]]
+        if not self.has_polygon_data:
+            return [0], []
+
+        to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
+        if not to_be_map_uv:
+            return self.polygon_offsets, self.polygon_points
+
+        mapped_points = []
+        for point_index in range(0, len(self.polygon_points), 2):
+            mapped_u, mapped_v = map_uv_into_range(
+                (self.polygon_points[point_index], self.polygon_points[point_index + 1]),
+                umin,
+                umax,
+                vmin,
+                vmax,
+            )
+            mapped_points.extend([mapped_u, mapped_v])
+        return list(self.polygon_offsets), mapped_points
 
     def get_draw_info(self, config, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
         # type: (EdgeLineDrawerConfig, float, float, float, float) -> Dict[Text, EdgeLineDrawInfo]
@@ -231,7 +264,8 @@ class MeshTopologyBuildSession(object):
         self.boundary_edges = []
         self.crease_edges = []
         self.fold_candidates = []
-        self.polygons = []
+        self.polygon_offsets = [0]
+        self.polygon_points = []
         if self.include_edges:
             self.phase = "crease"
         elif self.include_polygons:
@@ -359,9 +393,7 @@ class MeshTopologyBuildSession(object):
                     continue
 
                 us, vs = self.it_face_polygons.getUVs(self.uv_set_name)
-                deduped = dedupe_uv_points(us, vs)
-                if len(deduped) >= 3:
-                    self.polygons.append(UVPolygon(deduped))
+                append_deduped_uv_polygon(us, vs, self.polygon_offsets, self.polygon_points)
 
                 self.it_face_polygons.next()
                 self.phase_timings["faces"] += time.perf_counter() - phase_started
@@ -391,7 +423,8 @@ class MeshTopologyBuildSession(object):
                 "fold": [],
             },
             self.fold_candidates,
-            self.polygons,
+            polygon_offsets=self.polygon_offsets,
+            polygon_points=self.polygon_points,
             build_profile=self.phase_timings,
             has_edge_data=self.include_edges,
             has_polygon_data=self.include_polygons,
@@ -475,9 +508,9 @@ class DrawerPayloadBuffers(object):
         polygon_offsets,
         polygon_points,
         padding_warning,
-        json_fallback,
+        json_fallback_edges,
     ):
-        # type: (List[int], List[float], List[float], List[float], List[int], List[int], List[bool], List[bool], List[int], List[float], Optional[Dict[Text, Any]], Dict[Text, Any]) -> None
+        # type: (List[int], List[float], List[float], List[float], List[int], List[int], List[bool], List[bool], List[int], List[float], Optional[Dict[Text, Any]], List[EdgeLineDrawInfo]) -> None
         self.group_line_offsets = group_line_offsets
         self.line_points = line_points
         self.group_internal_widths = group_internal_widths
@@ -489,13 +522,19 @@ class DrawerPayloadBuffers(object):
         self.polygon_offsets = polygon_offsets
         self.polygon_points = polygon_points
         self.padding_warning = padding_warning
-        self._json_fallback = json_fallback
+        self._json_fallback_edges = json_fallback_edges
         self._json_string = None
 
     def as_json_string(self):
         # type: () -> Text
         if self._json_string is None:
-            self._json_string = edges_to_json_string(self._json_fallback)
+            self._json_string = edges_to_json_string(
+                {
+                    "edges": self._json_fallback_edges,
+                    "polygons": _polygons_from_flat_buffers(self.polygon_offsets, self.polygon_points),
+                    "padding_warning": self.padding_warning,
+                }
+            )
         return self._json_string
 
 
@@ -625,6 +664,71 @@ def dedupe_uv_points(us, vs):
     return deduped
 
 
+def append_deduped_uv_polygon(us, vs, polygon_offsets, polygon_points):
+    # type: (Iterable[float], Iterable[float], List[int], List[float]) -> bool
+    deduped_point_count = 0
+    previous_u = None
+    previous_v = None
+    first_u = None
+    first_v = None
+    start_len = len(polygon_points)
+
+    for u, v in zip(us, vs):
+        if previous_u == u and previous_v == v:
+            continue
+        if deduped_point_count == 0:
+            first_u = u
+            first_v = v
+        polygon_points.extend([float(u), float(v)])
+        previous_u = u
+        previous_v = v
+        deduped_point_count += 1
+
+    if deduped_point_count >= 3 and previous_u == first_u and previous_v == first_v:
+        del polygon_points[-2:]
+        deduped_point_count -= 1
+
+    if deduped_point_count < 3:
+        del polygon_points[start_len:]
+        return False
+
+    polygon_offsets.append(polygon_offsets[-1] + deduped_point_count)
+    return True
+
+
+def _polygon_offsets_from_polygons(polygons):
+    # type: (List[UVPolygon]) -> List[int]
+    polygon_offsets = [0]
+    polygon_point_count = 0
+    for polygon in polygons:
+        polygon_point_count += len(polygon.points)
+        polygon_offsets.append(polygon_point_count)
+    return polygon_offsets
+
+
+def _polygon_points_from_polygons(polygons):
+    # type: (List[UVPolygon]) -> List[float]
+    polygon_points = []
+    for polygon in polygons:
+        for point in polygon.points:
+            polygon_points.extend([float(point[0]), float(point[1])])
+    return polygon_points
+
+
+def _polygons_from_flat_buffers(polygon_offsets, polygon_points):
+    # type: (List[int], List[float]) -> List[UVPolygon]
+    polygons = []
+    for polygon_index in range(max(0, len(polygon_offsets) - 1)):
+        start = polygon_offsets[polygon_index]
+        end = polygon_offsets[polygon_index + 1]
+        points = []
+        for point_index in range(start, end):
+            base_index = point_index * 2
+            points.append((polygon_points[base_index], polygon_points[base_index + 1]))
+        polygons.append(UVPolygon(points))
+    return polygons
+
+
 def edges_to_json_string(edges):
     # type: (List|Dict) -> Text
     """Convert a list or dict of edge lines to a JSON string"""
@@ -672,21 +776,19 @@ def build_drawer_payload_buffers(payload):
             line_count += 1
         group_line_offsets.append(line_count)
 
-    polygon_offsets = [0]
-    polygon_points = []
-    polygon_point_count = 0
-    for polygon in payload["polygons"]:
-        for point in polygon.points:
-            polygon_points.extend([float(point[0]), float(point[1])])
-            polygon_point_count += 1
-        polygon_offsets.append(polygon_point_count)
+    polygon_offsets = payload.get("polygon_offsets")
+    polygon_points = payload.get("polygon_points")
+    if polygon_offsets is None or polygon_points is None:
+        polygon_offsets = [0]
+        polygon_points = []
+        polygon_point_count = 0
+        for polygon in payload["polygons"]:
+            for point in polygon.points:
+                polygon_points.extend([float(point[0]), float(point[1])])
+                polygon_point_count += 1
+            polygon_offsets.append(polygon_point_count)
 
     padding_warning = payload.get("padding_warning")
-    optimized_payload = {
-        "edges": merged_groups,
-        "polygons": payload["polygons"],
-        "padding_warning": padding_warning,
-    }
     return DrawerPayloadBuffers(
         group_line_offsets=group_line_offsets,
         line_points=line_points,
@@ -699,7 +801,7 @@ def build_drawer_payload_buffers(payload):
         polygon_offsets=polygon_offsets,
         polygon_points=polygon_points,
         padding_warning=padding_warning,
-        json_fallback=optimized_payload,
+        json_fallback_edges=merged_groups,
     )
 
 
