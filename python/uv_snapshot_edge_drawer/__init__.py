@@ -121,8 +121,8 @@ class MeshTopologySnapshot(object):
             polygon_offsets = _polygon_offsets_from_polygons(polygons or [])
         if polygon_points is None:
             polygon_points = _polygon_points_from_polygons(polygons or [])
-        self.polygon_offsets = list(polygon_offsets)
-        self.polygon_points = list(polygon_points)
+        self.polygon_offsets = polygon_offsets
+        self.polygon_points = polygon_points
         self.build_profile = dict(build_profile or {})
         self.has_edge_data = bool(has_edge_data)
         self.has_polygon_data = bool(has_polygon_data)
