@@ -587,7 +587,23 @@ def _get_warning_color():
 
 def _collect_selected_meshes():
     # type: () -> List[Text]
-    return cmds.ls(sl=True, dag=True, type="mesh", long=True) or []
+    try:
+        mesh_names = cmds.ls(sl=True, dag=True, noIntermediate=True, type="mesh", long=True) or []
+    except TypeError:
+        mesh_names = cmds.ls(sl=True, dag=True, type="mesh", long=True) or []
+
+    if mesh_names:
+        return mesh_names
+
+    filtered_meshes = []
+    for mesh_name in cmds.ls(sl=True, dag=True, type="mesh", long=True) or []:
+        try:
+            if cmds.getAttr(mesh_name + ".intermediateObject"):
+                continue
+        except Exception:
+            pass
+        filtered_meshes.append(mesh_name)
+    return filtered_meshes
 
 
 def _collect_snapshot_settings():
