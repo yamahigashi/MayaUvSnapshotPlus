@@ -136,7 +136,7 @@ class MeshTopologySnapshot(object):
         # type: (float, float, float, float) -> List[UVPolygon]
         to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
         if not to_be_map_uv:
-            return [UVPolygon([tuple(point) for point in polygon.points]) for polygon in self.polygons]
+            return self.polygons
 
         mapped = []
         for polygon in self.polygons:

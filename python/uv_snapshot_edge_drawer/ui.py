@@ -717,10 +717,16 @@ def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     u_min, u_max, v_min, v_max = settings["uv_min_max"]
     tmp_json = []
     tmp_polygons = []
+    draw_info_elapsed = 0.0
+    polygons_elapsed = 0.0
     for snapshot in snapshots:
+        phase_started = time.perf_counter()
         draw_info = snapshot.get_draw_info(config, u_min, u_max, v_min, v_max)
+        draw_info_elapsed += time.perf_counter() - phase_started
         tmp_json.extend(list(draw_info.values()))
+        phase_started = time.perf_counter()
         tmp_polygons.extend(snapshot.get_polygons(u_min, u_max, v_min, v_max))
+        polygons_elapsed += time.perf_counter() - phase_started
 
     padding_warning = _build_padding_warning_settings(settings, width_scale=width_scale)
     payload = {
@@ -730,8 +736,19 @@ def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     if padding_warning is not None:
         payload["padding_warning"] = padding_warning
 
+    phase_started = time.perf_counter()
     payload_data = drawer.build_drawer_payload_buffers(payload)
+    buffer_build_elapsed = time.perf_counter() - phase_started
+    profile_phases = {
+        "get_draw_info": draw_info_elapsed,
+        "get_polygons": polygons_elapsed,
+        "build_drawer_payload_buffers": buffer_build_elapsed,
+        "total": draw_info_elapsed + polygons_elapsed + buffer_build_elapsed,
+    }
+    if hasattr(payload_data, "__dict__"):
+        payload_data.profile_phases = profile_phases
     if drawer.PROFILE_ENABLED:
+        print("uv_snapshot_edge_drawer: payload phases {}".format(json.dumps(profile_phases, sort_keys=True)))
         print("uv_snapshot_edge_drawer: build snapshot payload {:.4f}s".format(time.time() - started_at))
     return payload_data
 
@@ -742,8 +759,18 @@ def _build_snapshot_json(settings, width_scale=1.0):
     if not mesh_names:
         return None, "Select a mesh to preview"
 
+    phase_started = time.perf_counter()
     snapshots = [drawer.get_mesh_topology_snapshot(mesh_name) for mesh_name in mesh_names]
-    return _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale), None
+    snapshot_elapsed = time.perf_counter() - phase_started
+    payload_data = _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale)
+    if hasattr(payload_data, "__dict__"):
+        profile_phases = getattr(payload_data, "profile_phases", None)
+        if profile_phases is None:
+            profile_phases = {}
+            payload_data.profile_phases = profile_phases
+        profile_phases["collect_snapshots"] = snapshot_elapsed
+        profile_phases["end_to_end_accounted"] = profile_phases.get("total", 0.0) + snapshot_elapsed
+    return payload_data, None
 
 
 def _capture_preview_request(generation):
