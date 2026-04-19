@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{Arg, Command};
-use edge_drawer::{draw_to_path_from_edges, Config, load_edges_input};
+use edge_drawer::draw_to_path_from_input;
 
-fn parse_arguments() -> Config {
+fn parse_arguments() -> (PathBuf, u32, u32, String) {
     let matches = Command::new("UV Image Edge Drawer")
         .version("1.0")
         .about("Draws edges on an image based on JSON input")
@@ -44,24 +44,13 @@ fn parse_arguments() -> Config {
         .unwrap()
         .parse()
         .expect("Invalid HEIGHT");
-    let edges_input = matches.get_one::<String>("EDGES").unwrap();
-    let edges = load_edges_input(edges_input).expect("Failed to parse edge data");
+    let edges_input = matches.get_one::<String>("EDGES").unwrap().to_string();
 
-    Config {
-        image_path,
-        width,
-        height,
-        edges,
-    }
+    (image_path, width, height, edges_input)
 }
 
 fn main() {
-    let config = parse_arguments();
-    draw_to_path_from_edges(
-        config.image_path.as_path(),
-        config.width,
-        config.height,
-        &config.edges,
-    )
+    let (image_path, width, height, edges_input) = parse_arguments();
+    draw_to_path_from_input(image_path.as_path(), width, height, &edges_input)
     .expect("Failed to draw edges");
 }
