@@ -709,6 +709,7 @@ def _append_deduped_uv_polygon_from_id_range(face_uv_ids, start_index, end_index
     first_u = None
     first_v = None
     start_len = len(polygon_points)
+    polygon_points_append = polygon_points.append
 
     for uv_id_index in range(start_index, end_index):
         uv_id = face_uv_ids[uv_id_index]
@@ -719,7 +720,8 @@ def _append_deduped_uv_polygon_from_id_range(face_uv_ids, start_index, end_index
         if deduped_point_count == 0:
             first_u = u
             first_v = v
-        polygon_points.extend([float(u), float(v)])
+        polygon_points_append(u)
+        polygon_points_append(v)
         previous_u = u
         previous_v = v
         deduped_point_count += 1
@@ -743,6 +745,10 @@ def build_polygon_buffers_from_mesh(fn_mesh, uv_set_name):
         return [0], []
 
     all_us, all_vs = fn_mesh.getUVs(uv_set_name)
+    face_uv_counts = list(face_uv_counts)
+    face_uv_ids = list(face_uv_ids)
+    all_us = list(all_us)
+    all_vs = list(all_vs)
     polygon_offsets = [0]
     polygon_points = []
     uv_index = 0
