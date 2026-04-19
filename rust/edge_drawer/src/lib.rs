@@ -135,6 +135,17 @@ struct SegmentArrangement {
     group_segments: Vec<Vec<CanonicalSegment>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SegmentBounds {
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+#[derive(Clone, Debug)]
+struct UniformGridIndex {
+    cells: HashMap<(i32, i32), Vec<usize>>,
+}
+
 fn default_padding_pixels() -> f32 {
     8.0
 }
@@ -319,6 +330,10 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
     let mut point_positions = collect_point_positions(edges);
     let original_segments = collect_unique_segments(edges);
     let mut split_points: HashMap<CanonicalSegment, HashSet<QPoint>> = HashMap::new();
+    let segment_bounds = original_segments
+        .iter()
+        .map(|segment| segment_bounds_uv(*segment, &point_positions))
+        .collect::<Vec<_>>();
 
     for segment in &original_segments {
         split_points
@@ -327,21 +342,19 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
             .extend([segment.start, segment.end]);
     }
 
-    for left_index in 0..original_segments.len() {
-        for right_index in (left_index + 1)..original_segments.len() {
-            let left = original_segments[left_index];
-            let right = original_segments[right_index];
-            let left_start = point_positions[&left.start];
-            let left_end = point_positions[&left.end];
-            let right_start = point_positions[&right.start];
-            let right_end = point_positions[&right.end];
+    for (left_index, right_index) in collect_candidate_pairs(&segment_bounds, 0.0) {
+        let left = original_segments[left_index];
+        let right = original_segments[right_index];
+        let left_start = point_positions[&left.start];
+        let left_end = point_positions[&left.end];
+        let right_start = point_positions[&right.start];
+        let right_end = point_positions[&right.end];
 
-            for point in split_intersection_points(left_start, left_end, right_start, right_end) {
-                let quantized = quantize_point(point);
-                point_positions.entry(quantized).or_insert(point);
-                split_points.entry(left).or_default().insert(quantized);
-                split_points.entry(right).or_default().insert(quantized);
-            }
+        for point in split_intersection_points(left_start, left_end, right_start, right_end) {
+            let quantized = quantize_point(point);
+            point_positions.entry(quantized).or_insert(point);
+            split_points.entry(left).or_default().insert(quantized);
+            split_points.entry(right).or_default().insert(quantized);
         }
     }
 
@@ -597,6 +610,127 @@ fn collect_unique_segments(edges: &[Edges]) -> Vec<CanonicalSegment> {
     segments
 }
 
+fn default_grid_resolution(count: usize) -> u32 {
+    if count <= 1 {
+        return 16;
+    }
+
+    let target = (count as f32).sqrt().ceil() as u32;
+    target.next_power_of_two().clamp(16, 256)
+}
+
+fn build_uniform_grid(bounds: &[SegmentBounds], expand: f32) -> UniformGridIndex {
+    let resolution = default_grid_resolution(bounds.len());
+    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+
+    for (idx, bounds) in bounds.iter().enumerate() {
+        let min_x = cell_coord(bounds.min[0] - expand, resolution);
+        let max_x = cell_coord(bounds.max[0] + expand, resolution);
+        let min_y = cell_coord(bounds.min[1] - expand, resolution);
+        let max_y = cell_coord(bounds.max[1] + expand, resolution);
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                cells.entry((x, y)).or_default().push(idx);
+            }
+        }
+    }
+
+    UniformGridIndex { cells }
+}
+
+fn collect_candidate_pairs(bounds: &[SegmentBounds], expand: f32) -> Vec<(usize, usize)> {
+    if bounds.len() < 2 {
+        return Vec::new();
+    }
+
+    let grid = build_uniform_grid(bounds, expand);
+    let mut pairs = HashSet::new();
+
+    for indices in grid.cells.values() {
+        for left_index in 0..indices.len() {
+            for right_index in (left_index + 1)..indices.len() {
+                let left = indices[left_index];
+                let right = indices[right_index];
+                let pair = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+
+                if bounds_overlap(bounds[pair.0], bounds[pair.1], expand) {
+                    pairs.insert(pair);
+                }
+            }
+        }
+    }
+
+    let mut pairs = pairs.into_iter().collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs
+}
+
+fn bounds_overlap(left: SegmentBounds, right: SegmentBounds, expand: f32) -> bool {
+    left.min[0] - expand <= right.max[0] + expand
+        && left.max[0] + expand >= right.min[0] - expand
+        && left.min[1] - expand <= right.max[1] + expand
+        && left.max[1] + expand >= right.min[1] - expand
+}
+
+fn cell_coord(value: f32, resolution: u32) -> i32 {
+    let scaled = (value.clamp(0.0, 1.0) * resolution as f32).floor() as i32;
+    scaled.clamp(0, resolution as i32 - 1)
+}
+
+fn segment_bounds_uv(
+    segment: CanonicalSegment,
+    point_positions: &HashMap<QPoint, [f32; 2]>,
+) -> SegmentBounds {
+    let start = point_positions[&segment.start];
+    let end = point_positions[&segment.end];
+    SegmentBounds {
+        min: [start[0].min(end[0]), start[1].min(end[1])],
+        max: [start[0].max(end[0]), start[1].max(end[1])],
+    }
+}
+
+fn segment_bounds_canvas(segment: CanonicalSegment, width: u32, height: u32) -> SegmentBounds {
+    let start = to_canvas_point(segment.start, width, height);
+    let end = to_canvas_point(segment.end, width, height);
+    SegmentBounds {
+        min: [start[0].min(end[0]), start[1].min(end[1])],
+        max: [start[0].max(end[0]), start[1].max(end[1])],
+    }
+}
+
+fn build_canvas_grid(
+    segments: &[CanonicalSegment],
+    width: u32,
+    height: u32,
+    expand_pixels: f32,
+) -> UniformGridIndex {
+    let resolution = default_grid_resolution(segments.len());
+    let width_f = width.max(1) as f32;
+    let height_f = height.max(1) as f32;
+    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let bounds = segment_bounds_canvas(*segment, width, height);
+        let min_x = (((bounds.min[0] - expand_pixels).max(0.0) / width_f) * resolution as f32).floor() as i32;
+        let max_x = (((bounds.max[0] + expand_pixels).min(width_f) / width_f) * resolution as f32).floor() as i32;
+        let min_y = (((bounds.min[1] - expand_pixels).max(0.0) / height_f) * resolution as f32).floor() as i32;
+        let max_y = (((bounds.max[1] + expand_pixels).min(height_f) / height_f) * resolution as f32).floor() as i32;
+
+        for x in min_x.clamp(0, resolution as i32 - 1)..=max_x.clamp(0, resolution as i32 - 1) {
+            for y in min_y.clamp(0, resolution as i32 - 1)..=max_y.clamp(0, resolution as i32 - 1) {
+                cells.entry((x, y)).or_default().push(idx);
+            }
+        }
+    }
+
+    UniformGridIndex { cells }
+}
+
 fn detect_padding_warning_segments(
     outline_segments: &HashSet<CanonicalSegment>,
     point_positions: &HashMap<QPoint, [f32; 2]>,
@@ -632,40 +766,47 @@ fn detect_padding_warning_segments(
         }
     }
 
-    let component_segments = collect_component_segments(&outline_segments, &outline_components);
-    let mut component_ids = component_segments.keys().copied().collect::<Vec<_>>();
-    component_ids.sort_unstable();
+    let segment_component_ids = outline_segments
+        .iter()
+        .map(|segment| outline_components.get(&segment.start).copied().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let canvas_grid = build_canvas_grid(
+        &outline_segments,
+        width,
+        height,
+        padding_warning.padding_pixels,
+    );
+    let mut candidate_pairs = HashSet::new();
 
-    for left_index in 0..component_ids.len() {
-        for right_index in (left_index + 1)..component_ids.len() {
-            let left_segments = &component_segments[&component_ids[left_index]];
-            let right_segments = &component_segments[&component_ids[right_index]];
-            for &left in left_segments {
-                for &right in right_segments {
-                    if segment_distance_pixels(left, right, width, height)
-                        < padding_warning.padding_pixels
-                    {
-                        warning_segments.insert(left);
-                        warning_segments.insert(right);
-                    }
-                }
+    for indices in canvas_grid.cells.values() {
+        for left_index in 0..indices.len() {
+            for right_index in (left_index + 1)..indices.len() {
+                let pair = if indices[left_index] < indices[right_index] {
+                    (indices[left_index], indices[right_index])
+                } else {
+                    (indices[right_index], indices[left_index])
+                };
+                candidate_pairs.insert(pair);
             }
         }
     }
 
-    warning_segments
-}
+    let mut candidate_pairs = candidate_pairs.into_iter().collect::<Vec<_>>();
+    candidate_pairs.sort_unstable();
 
-fn collect_component_segments(
-    segments: &[CanonicalSegment],
-    components: &HashMap<QPoint, usize>,
-) -> HashMap<usize, Vec<CanonicalSegment>> {
-    let mut result = HashMap::new();
-    for &segment in segments {
-        let component_id = components.get(&segment.start).copied().unwrap_or_default();
-        result.entry(component_id).or_insert_with(Vec::new).push(segment);
+    for (left_index, right_index) in candidate_pairs {
+        if segment_component_ids[left_index] == segment_component_ids[right_index] {
+            continue;
+        }
+        let left = outline_segments[left_index];
+        let right = outline_segments[right_index];
+        if segment_distance_pixels(left, right, width, height) < padding_warning.padding_pixels {
+            warning_segments.insert(left);
+            warning_segments.insert(right);
+        }
     }
-    result
+
+    warning_segments
 }
 
 fn segment_border_distance_pixels(
