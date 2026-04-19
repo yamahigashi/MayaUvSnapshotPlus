@@ -745,10 +745,6 @@ def build_polygon_buffers_from_mesh(fn_mesh, uv_set_name):
         return [0], []
 
     all_us, all_vs = fn_mesh.getUVs(uv_set_name)
-    face_uv_counts = list(face_uv_counts)
-    face_uv_ids = list(face_uv_ids)
-    all_us = list(all_us)
-    all_vs = list(all_vs)
 
     try:
         from uv_snapshot_edge_drawer import _edge_drawer
@@ -757,6 +753,11 @@ def build_polygon_buffers_from_mesh(fn_mesh, uv_set_name):
             return _edge_drawer.build_polygon_buffers(face_uv_counts, face_uv_ids, all_us, all_vs)
     except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
         pass
+
+    face_uv_counts = list(face_uv_counts)
+    face_uv_ids = list(face_uv_ids)
+    all_us = list(all_us)
+    all_vs = list(all_vs)
 
     polygon_offsets = [0]
     polygon_points = []
