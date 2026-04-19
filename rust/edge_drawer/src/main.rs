@@ -52,5 +52,5 @@ fn parse_arguments() -> (PathBuf, u32, u32, String) {
 fn main() {
     let (image_path, width, height, edges_input) = parse_arguments();
     draw_to_path_from_input(image_path.as_path(), width, height, &edges_input)
-    .expect("Failed to draw edges");
+        .expect("Failed to draw edges");
 }
