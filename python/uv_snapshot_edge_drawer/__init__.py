@@ -5,6 +5,7 @@ import math
 import json
 import tempfile
 import subprocess
+import os
 
 from maya.api import OpenMaya as om
 from maya import (
@@ -327,40 +328,74 @@ def get_edge_lines(
 
 def execute_drawer(image_path, width, height, json_data):
     # type: (Text, int, int, Text) -> None
-    """Execute the edge_drawer.exe with the given arguments"""
+    """Execute the native drawer when available, otherwise fallback to edge_drawer.exe"""
 
-    # if len(json_data) > 7500:  # windows cmd line length limit is 8191
-    if len(json_data) > 1:  # windows cmd line length limit is 8191
-
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
-            temp_file.write(json_data)
-            json_data = temp_file.name
-
-    cmd = " ".join([
-        "edge_drawer",
-        image_path,
-        str(width),
-        str(height),
-        json_data,
-    ])
+    image_path = _normalize_output_path(image_path)
 
     if sys.version_info > (3, 0):
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        # stdout = result.stdout
-        stderr = result.stderr
-        if stderr:
-            print(cmd)
-            cmds.error(stderr)
+        try:
+            from uv_snapshot_edge_drawer import _edge_drawer
+            _edge_drawer.draw_edges(image_path, width, height, json_data)
+        except Exception as exc:
+            _execute_drawer_cli(image_path, width, height, json_data, native_error=exc)
             return
     else:
-        # python 2.7 does not have subprocess.run
-        result = subprocess.call(cmd, shell=True)
-        if result != 0:
-            print(cmd)
-            cmds.error("edge_drawer.exe error")
-            return
+        _execute_drawer_cli(image_path, width, height, json_data)
 
     subprocess.call("start " + image_path, shell=True)
+
+
+def _normalize_output_path(image_path):
+    # type: (Text) -> Text
+    """Default to PNG when no output extension is provided."""
+
+    _, ext = os.path.splitext(image_path)
+    if ext:
+        return image_path
+    return image_path + ".png"
+
+
+def _execute_drawer_cli(image_path, width, height, json_data, native_error=None):
+    # type: (Text, int, int, Text, Optional[Exception]) -> None
+    """Execute the CLI fallback."""
+
+    temp_path = None
+    try:
+        # Avoid Windows command line length limits in the fallback path.
+        if len(json_data) > 7500:
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
+                temp_file.write(json_data)
+                temp_path = temp_file.name
+            json_data = temp_path
+
+        args = [
+            "edge_drawer",
+            image_path,
+            str(width),
+            str(height),
+            json_data,
+        ]
+
+        if sys.version_info > (3, 0):
+            result = subprocess.run(args, capture_output=True, text=True)
+            if result.returncode != 0:
+                if native_error is not None:
+                    print("native edge drawer failed: {}".format(native_error))
+                print(" ".join(args))
+                cmds.error(result.stderr or "edge_drawer.exe error")
+                return
+        else:
+            cmd = subprocess.list2cmdline(args)
+            result = subprocess.call(cmd, shell=True)
+            if result != 0:
+                if native_error is not None:
+                    print("native edge drawer failed: {}".format(native_error))
+                print(cmd)
+                cmds.error("edge_drawer.exe error")
+                return
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 ##############################################################################
