@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import textwrap
+import time
 
 from maya import (
     cmds,
@@ -47,6 +48,81 @@ EDGE_APPEARANCE_SPECS = [
 PREVIEW_MAX_DIMENSION = 512
 WARNING_COLOR = (1.0, 0.25, 0.25)
 WARNING_WIDTH = 4
+PREVIEW_DEBOUNCE_MS = 150
+
+
+try:
+    from PySide6 import QtCore  # type: ignore
+except Exception:
+    try:
+        from PySide2 import QtCore  # type: ignore
+    except Exception:
+        QtCore = None  # type: ignore
+
+
+class PreviewRefreshController(object):
+    """Serialize expensive preview refreshes and debounce drag updates."""
+
+    def __init__(self, callback):
+        # type: (Callable[[], None]) -> None
+        self.callback = callback
+        self._running = False
+        self._rerun_requested = False
+        self._timer = None
+        if QtCore is not None:
+            self._timer = QtCore.QTimer()
+            self._timer.setSingleShot(True)
+            self._timer.timeout.connect(self._run)
+
+    def request_refresh(self, immediate=False):
+        # type: (bool) -> None
+        if self._running:
+            self._rerun_requested = True
+            if immediate and self._timer is not None:
+                self._timer.start(0)
+            return
+
+        if immediate or self._timer is None:
+            self._run()
+        else:
+            self._timer.start(PREVIEW_DEBOUNCE_MS)
+
+    def _run(self):
+        # type: () -> None
+        if not cmds.window("settingsWindow", exists=True):
+            return
+
+        if self._running:
+            self._rerun_requested = True
+            return
+
+        self._running = True
+        try:
+            self.callback()
+        finally:
+            self._running = False
+            if self._rerun_requested:
+                self._rerun_requested = False
+                if self._timer is not None:
+                    self._timer.start(0)
+                else:
+                    self._run()
+
+
+_preview_refresh_controller = None
+
+
+def _get_preview_refresh_controller():
+    # type: () -> PreviewRefreshController
+    global _preview_refresh_controller
+    if _preview_refresh_controller is None:
+        _preview_refresh_controller = PreviewRefreshController(_refresh_preview_now)
+    return _preview_refresh_controller
+
+
+def schedule_preview_refresh(immediate=False):
+    # type: (bool) -> None
+    _get_preview_refresh_controller().request_refresh(immediate=immediate)
 
 
 def _edge_control_name(edge_key, suffix):
@@ -215,7 +291,7 @@ def _pick_edge_color(edge_key, mode):
     if cmds.colorEditor(query=True, result=True):
         color = cmds.colorEditor(query=True, rgb=True)
         cmds.button(swatch_name, edit=True, backgroundColor=color)
-        refresh_preview()
+        schedule_preview_refresh(immediate=True)
 
 
 def _get_edge_color(edge_key, mode):
@@ -261,7 +337,7 @@ def _sync_width_from_slider(edge_key, mode, value):
         edit=True,
         value=int(value),
     )
-    refresh_preview()
+    schedule_preview_refresh(immediate=False)
 
 
 def _sync_width_from_field(edge_key, mode, value):
@@ -277,7 +353,7 @@ def _sync_width_from_field(edge_key, mode, value):
         edit=True,
         value=value,
     )
-    refresh_preview()
+    schedule_preview_refresh(immediate=True)
 
 
 def _set_edge_row_visible(edge_key, visible):
@@ -313,7 +389,7 @@ def _pick_warning_color(*_args):
     if cmds.colorEditor(query=True, result=True):
         color = cmds.colorEditor(query=True, rgb=True)
         cmds.button("paddingWarningColorSwatch", edit=True, backgroundColor=color)
-        refresh_preview()
+        schedule_preview_refresh(immediate=True)
 
 
 def _get_warning_color():
@@ -457,7 +533,8 @@ def _build_padding_warning_settings(settings, width_scale=1.0):
 
 def _build_snapshot_json(settings, width_scale=1.0):
     # type: (Dict[Text, Any], float) -> Tuple[Optional[Text], Optional[Text]]
-    mesh = cmds.ls(sl=True, dag=True, type="mesh")
+    started_at = time.time()
+    mesh = cmds.ls(sl=True, dag=True, type="mesh", long=True)
     if not mesh:
         return None, "Select a mesh to preview"
 
@@ -479,7 +556,10 @@ def _build_snapshot_json(settings, width_scale=1.0):
     if padding_warning is not None:
         payload["padding_warning"] = padding_warning
 
-    return drawer.edges_to_json_string(payload), None
+    json_data = drawer.edges_to_json_string(payload)
+    if drawer.PROFILE_ENABLED:
+        print("uv_snapshot_edge_drawer: build snapshot json {:.4f}s".format(time.time() - started_at))
+    return json_data, None
 
 
 def _get_preview_dimensions(settings):
@@ -509,8 +589,10 @@ def _set_preview_image(image_path, width, height):
     )
 
 
-def refresh_preview(*args):
+def _refresh_preview_now():
+    # type: () -> None
     # type: (*Any) -> None
+    started_at = time.time()
     settings = _collect_snapshot_settings()
     preview_width, preview_height = _get_preview_dimensions(settings)
     width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
@@ -534,17 +616,24 @@ def refresh_preview(*args):
         return
 
     _set_preview_image(preview_path, preview_width, preview_height)
+    if drawer.PROFILE_ENABLED:
+        print("uv_snapshot_edge_drawer: refresh preview {:.4f}s".format(time.time() - started_at))
+
+
+def refresh_preview(*args):
+    # type: (*Any) -> None
+    _refresh_preview_now()
 
 
 def _on_edge_mode_changed(edge_key):
     # type: (Text) -> None
     update_controls()
-    refresh_preview()
+    schedule_preview_refresh(immediate=True)
 
 
 def _on_uv_area_changed(*args):
     uv_snapchot_ctrl_changed()
-    refresh_preview()
+    schedule_preview_refresh(immediate=True)
 
 
 def _on_output_mode_changed(*args):
@@ -656,14 +745,14 @@ def show_ui():
         "paddingWarningEnabled",
         label="Padding Warning",
         value=False,
-        changeCommand=lambda *_args: (_update_padding_warning_controls(), refresh_preview()),
+        changeCommand=lambda *_args: (_update_padding_warning_controls(), schedule_preview_refresh(immediate=True)),
     )
     cmds.intField(
         "paddingPixelsField",
         minValue=1,
         maxValue=4096,
         value=8,
-        changeCommand=lambda *_args: refresh_preview(),
+        changeCommand=lambda *_args: schedule_preview_refresh(immediate=True),
     )
     cmds.button(
         "paddingWarningColorSwatch",
@@ -679,7 +768,7 @@ def show_ui():
         minValue=1,
         maxValue=100,
         value=WARNING_WIDTH,
-        changeCommand=lambda *_args: refresh_preview(),
+        changeCommand=lambda *_args: schedule_preview_refresh(immediate=True),
     )
     cmds.setParent("..")
     
@@ -790,25 +879,26 @@ def show_ui():
     )
     cmds.button(label="Close", command='cmds.deleteUI("settingsWindow", window=True)')
 
-    cmds.intSliderGrp("foldAngle", edit=True, changeCommand=refresh_preview)
-    cmds.intSliderGrp("resoX", edit=True, changeCommand=refresh_preview)
-    cmds.intSliderGrp("resoY", edit=True, changeCommand=refresh_preview)
+    cmds.intSliderGrp("foldAngle", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.intSliderGrp("resoX", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.intSliderGrp("resoY", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
     cmds.radioButtonGrp("uvAreaTileCtrl", edit=True, changeCommand=_on_uv_area_changed)
     cmds.radioButtonGrp("uvAreaRangeCtrl", edit=True, changeCommand=_on_uv_area_changed)
-    cmds.intField("uvAreaTileU", edit=True, changeCommand=refresh_preview)
-    cmds.intField("uvAreaTileV", edit=True, changeCommand=refresh_preview)
-    cmds.floatSliderGrp("uvSnapshotUMinCtrl", edit=True, changeCommand=refresh_preview)
-    cmds.floatSliderGrp("uvSnapshotUMaxCtrl", edit=True, changeCommand=refresh_preview)
-    cmds.floatSliderGrp("uvSnapshotVMinCtrl", edit=True, changeCommand=refresh_preview)
-    cmds.floatSliderGrp("uvSnapshotVMaxCtrl", edit=True, changeCommand=refresh_preview)
+    cmds.intField("uvAreaTileU", edit=True, changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.intField("uvAreaTileV", edit=True, changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.floatSliderGrp("uvSnapshotUMinCtrl", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.floatSliderGrp("uvSnapshotUMaxCtrl", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.floatSliderGrp("uvSnapshotVMinCtrl", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
+    cmds.floatSliderGrp("uvSnapshotVMaxCtrl", edit=True, dragCommand=lambda *_args: schedule_preview_refresh(immediate=False), changeCommand=lambda *_args: schedule_preview_refresh(immediate=True))
 
     # Call update_controls initially to set the correct states
     update_controls()
 
     # Show the window
     uv_snapchot_ctrl_changed()
+    cmds.scriptJob(uiDeleted=("settingsWindow", "import uv_snapshot_edge_drawer as drawer; drawer.clear_mesh_topology_cache()"))
     cmds.showWindow(settingsWindow)
-    refresh_preview()
+    schedule_preview_refresh(immediate=True)
 
 
 def update_controls(*args):
@@ -880,7 +970,7 @@ def snapshot():
         )
     else:
         _render_snapshot_to_clipboard(settings, json_data)
-    refresh_preview()
+    schedule_preview_refresh(immediate=True)
     if settings["output_mode"] == 1:
         message = "Exported: {}".format(settings["file_path"])
     else:

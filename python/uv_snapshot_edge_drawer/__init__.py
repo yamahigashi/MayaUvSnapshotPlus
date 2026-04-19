@@ -6,6 +6,7 @@ import json
 import tempfile
 import subprocess
 import os
+import time
 
 from maya.api import OpenMaya as om
 from maya import (
@@ -82,6 +83,70 @@ class EdgeLineDrawerConfig:
                 self.settings["fold"]["fold_angle"] = fold_angle
 
 
+PROFILE_ENABLED = os.environ.get("MAYA_UV_SNAPSHOT_PROFILE") == "1"
+_MESH_TOPOLOGY_CACHE = {}
+_MESH_DIRTY_CALLBACKS = {}
+
+
+def _profile_log(label, started_at):
+    # type: (Text, float) -> None
+    if PROFILE_ENABLED:
+        print("uv_snapshot_edge_drawer: {} {:.4f}s".format(label, time.time() - started_at))
+
+
+class FoldCandidate(object):
+    """Fold edge candidate with precalculated face angle."""
+
+    def __init__(self, angle_radians, lines):
+        # type: (float, List[EdgeLine]) -> None
+        self.angle_radians = angle_radians
+        self.lines = lines
+
+
+class MeshTopologySnapshot(object):
+    """Cacheable topology-derived UV data for a mesh and UV set."""
+
+    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons):
+        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon]) -> None
+        self.mesh_name = mesh_name
+        self.uv_set_name = uv_set_name
+        self.edge_lines = edge_lines
+        self.fold_candidates = fold_candidates
+        self.polygons = polygons
+
+    def get_edge_lines(self, fold_angle):
+        # type: (float) -> Dict[Text, List[EdgeLine]]
+        result = {}
+        for key, lines in self.edge_lines.items():
+            result[key] = list(lines)
+
+        fold_threshold = math.radians(fold_angle)
+        fold_lines = []
+        for candidate in self.fold_candidates:
+            if candidate.angle_radians > fold_threshold:
+                fold_lines.extend(candidate.lines)
+        result["fold"] = fold_lines
+        return result
+
+    def get_polygons(self, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
+        # type: (float, float, float, float) -> List[UVPolygon]
+        to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
+        if not to_be_map_uv:
+            return [UVPolygon([tuple(point) for point in polygon.points]) for polygon in self.polygons]
+
+        mapped = []
+        for polygon in self.polygons:
+            mapped.append(
+                UVPolygon(
+                    [
+                        map_uv_into_range(point, umin, umax, vmin, vmax)
+                        for point in polygon.points
+                    ]
+                )
+            )
+        return mapped
+
+
 class MeshEdges(object):
     """Class to store edge line info for a mesh
 
@@ -94,16 +159,8 @@ class MeshEdges(object):
 
         self.mesh = get_mfnmesh_from_meshlike(mesh)
         self.config = config
-        self.edge_lines = get_edge_lines(
-                self.mesh,
-                soft=_should_draw_edge_type(config, "soft"),
-                hard=_should_draw_edge_type(config, "hard"),
-                fold=_should_draw_edge_type(config, "fold"),
-                crease=_should_draw_edge_type(config, "crease"),
-                border=_should_draw_edge_type(config, "border"),
-                boundary=_should_draw_edge_type(config, "boundary"),
-                fold_angle=config.get_setting("fold")["fold_angle"]
-        )
+        topology = get_mesh_topology_snapshot(self.mesh)
+        self.edge_lines = topology.get_edge_lines(config.get_setting("fold")["fold_angle"])
 
     def get_draw_info(self, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
         # type: (float, float, float, float) -> Dict[Text, EdgeLineDrawInfo]
@@ -385,23 +442,116 @@ def get_edge_lines(
     return result
 
 
-def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
-    # type: (MeshLike, float, float, float, float) -> List[UVPolygon]
+def _get_mesh_cache_key(fn_mesh):
+    # type: (om.MFnMesh) -> Tuple[Text, Text]
+    return fn_mesh.fullPathName(), fn_mesh.currentUVSetName()
+
+
+def _invalidate_mesh_topology_cache(mesh_name):
+    # type: (Text) -> None
+    stale_keys = [key for key in _MESH_TOPOLOGY_CACHE if key[0] == mesh_name]
+    for key in stale_keys:
+        _MESH_TOPOLOGY_CACHE.pop(key, None)
+
+
+def _register_mesh_dirty_callback(fn_mesh):
+    # type: (om.MFnMesh) -> None
+    mesh_name = fn_mesh.fullPathName()
+    if mesh_name in _MESH_DIRTY_CALLBACKS:
+        return
+
+    def _on_dirty(*_args):
+        _invalidate_mesh_topology_cache(mesh_name)
+
+    callback_id = om.MNodeMessage.addNodeDirtyPlugCallback(fn_mesh.object(), _on_dirty)
+    _MESH_DIRTY_CALLBACKS[mesh_name] = callback_id
+
+
+def clear_mesh_topology_cache():
+    # type: () -> None
+    for callback_id in list(_MESH_DIRTY_CALLBACKS.values()):
+        try:
+            om.MMessage.removeCallback(callback_id)
+        except RuntimeError:
+            pass
+    _MESH_DIRTY_CALLBACKS.clear()
+    _MESH_TOPOLOGY_CACHE.clear()
+
+
+def get_mesh_topology_snapshot(meshlike):
+    # type: (MeshLike) -> MeshTopologySnapshot
     fn_mesh = get_mfnmesh_from_meshlike(meshlike)
+    cache_key = _get_mesh_cache_key(fn_mesh)
+    cached = _MESH_TOPOLOGY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    started_at = time.time()
     uv_set_name = fn_mesh.currentUVSetName()
+    current_uv_set_id = get_current_uv_set_id(fn_mesh)
+
+    hard_edges_uvs = []
+    soft_edges_uvs = []
+    border_edges = []
+    boundary_edges = []
+    crease_edges = []
+    fold_candidates = []
+    polygons = []
+
+    it_vert = om.MItMeshVertex(fn_mesh.object())
+    it_edge = om.MItMeshEdge(fn_mesh.object())
     it_face = om.MItMeshPolygon(fn_mesh.object())
 
-    to_be_map_uv = (umin != 0.0 or vmin != 0.0 or umax != 1.0 or vmax != 1.0)
-    polygons = []
+    try:
+        crease_ids, _ = fn_mesh.getCreaseEdges()
+        for edge_id in crease_ids:
+            it_edge.setIndex(edge_id)
+            crease_edges.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name))
+    except RuntimeError:
+        pass
+
+    if cmds.about(apiVersion=True) >= 20230000:
+        border_ids = fn_mesh.getUVBorderEdges(current_uv_set_id)
+        for edge_id in border_ids:
+            it_edge.setIndex(edge_id)
+            border_edges.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name))
+
+    while not it_edge.isDone():
+        lines = get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name)
+
+        if not it_edge.isSmooth:
+            hard_edges_uvs.extend(lines)
+        else:
+            soft_edges_uvs.extend(lines)
+
+        if it_edge.onBoundary():
+            boundary_edges.extend(lines)
+
+        if it_edge.numConnectedFaces() >= 2:
+            conncetded_ids = it_edge.getConnectedFaces()
+            face_id1 = conncetded_ids[0]
+            face_id2 = conncetded_ids[1]
+
+            it_face.setIndex(face_id1)
+            norm1 = it_face.getNormal()
+
+            it_face.setIndex(face_id2)
+            norm2 = it_face.getNormal()
+
+            angle = norm1.angle(norm2)
+            candidate_lines = []
+            candidate_lines.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id1))
+            candidate_lines.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id2))
+            if candidate_lines:
+                fold_candidates.append(FoldCandidate(angle, candidate_lines))
+
+        it_edge.next()
 
     while not it_face.isDone():
         us, vs = it_face.getUVs(uv_set_name)
         points = []
         for u, v in zip(us, vs):
-            point = (u, v)
-            if to_be_map_uv:
-                point = map_uv_into_range(point, umin, umax, vmin, vmax)
-            points.append(point)
+            points.append((u, v))
 
         deduped = []
         for point in points:
@@ -414,7 +564,29 @@ def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
 
         it_face.next()
 
-    return polygons
+    snapshot = MeshTopologySnapshot(
+        fn_mesh.fullPathName(),
+        uv_set_name,
+        {
+            "hard": hard_edges_uvs,
+            "soft": soft_edges_uvs,
+            "border": border_edges,
+            "boundary": boundary_edges,
+            "crease": crease_edges,
+            "fold": [],
+        },
+        fold_candidates,
+        polygons,
+    )
+    _MESH_TOPOLOGY_CACHE[cache_key] = snapshot
+    _register_mesh_dirty_callback(fn_mesh)
+    _profile_log("mesh topology build {}".format(fn_mesh.fullPathName()), started_at)
+    return snapshot
+
+
+def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
+    # type: (MeshLike, float, float, float, float) -> List[UVPolygon]
+    return get_mesh_topology_snapshot(meshlike).get_polygons(umin, umax, vmin, vmax)
 
 
 def execute_drawer(image_path, width, height, json_data, open_after_save=True):
