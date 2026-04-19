@@ -391,11 +391,16 @@ class MeshTopologyBuildSession(object):
                     self.phase_timings["faces"] += time.perf_counter() - phase_started
                     self.phase = "finalize"
                     continue
-
-                us, vs = self.it_face_polygons.getUVs(self.uv_set_name)
-                append_deduped_uv_polygon(us, vs, self.polygon_offsets, self.polygon_points)
-
-                self.it_face_polygons.next()
+                try:
+                    self.polygon_offsets, self.polygon_points = build_polygon_buffers_from_mesh(
+                        self.fn_mesh,
+                        self.uv_set_name,
+                    )
+                    self.phase = "finalize"
+                except RuntimeError:
+                    us, vs = self.it_face_polygons.getUVs(self.uv_set_name)
+                    append_deduped_uv_polygon(us, vs, self.polygon_offsets, self.polygon_points)
+                    self.it_face_polygons.next()
                 self.phase_timings["faces"] += time.perf_counter() - phase_started
                 processed += 1
                 continue
@@ -694,6 +699,69 @@ def append_deduped_uv_polygon(us, vs, polygon_offsets, polygon_points):
 
     polygon_offsets.append(polygon_offsets[-1] + deduped_point_count)
     return True
+
+
+def _append_deduped_uv_polygon_from_id_range(face_uv_ids, start_index, end_index, all_us, all_vs, polygon_offsets, polygon_points):
+    # type: (Iterable[int], int, int, Iterable[float], Iterable[float], List[int], List[float]) -> bool
+    deduped_point_count = 0
+    previous_u = None
+    previous_v = None
+    first_u = None
+    first_v = None
+    start_len = len(polygon_points)
+
+    for uv_id_index in range(start_index, end_index):
+        uv_id = face_uv_ids[uv_id_index]
+        u = all_us[uv_id]
+        v = all_vs[uv_id]
+        if previous_u == u and previous_v == v:
+            continue
+        if deduped_point_count == 0:
+            first_u = u
+            first_v = v
+        polygon_points.extend([float(u), float(v)])
+        previous_u = u
+        previous_v = v
+        deduped_point_count += 1
+
+    if deduped_point_count >= 3 and previous_u == first_u and previous_v == first_v:
+        del polygon_points[-2:]
+        deduped_point_count -= 1
+
+    if deduped_point_count < 3:
+        del polygon_points[start_len:]
+        return False
+
+    polygon_offsets.append(polygon_offsets[-1] + deduped_point_count)
+    return True
+
+
+def build_polygon_buffers_from_mesh(fn_mesh, uv_set_name):
+    # type: (om.MFnMesh, Text) -> Tuple[List[int], List[float]]
+    face_uv_counts, face_uv_ids = fn_mesh.getAssignedUVs(uv_set_name)
+    if not face_uv_counts:
+        return [0], []
+
+    all_us, all_vs = fn_mesh.getUVs(uv_set_name)
+    polygon_offsets = [0]
+    polygon_points = []
+    uv_index = 0
+    for face_uv_count in face_uv_counts:
+        face_uv_count = int(face_uv_count)
+        if face_uv_count <= 0:
+            continue
+        next_uv_index = uv_index + face_uv_count
+        _append_deduped_uv_polygon_from_id_range(
+            face_uv_ids,
+            uv_index,
+            next_uv_index,
+            all_us,
+            all_vs,
+            polygon_offsets,
+            polygon_points,
+        )
+        uv_index = next_uv_index
+    return polygon_offsets, polygon_points
 
 
 def _polygon_offsets_from_polygons(polygons):
