@@ -33,6 +33,124 @@ if sys.version_info > (3, 0):
 # 
 ##############################################################################
 
+EDGE_APPEARANCE_SPECS = [
+    ("soft", "Soft Edge", (0.8, 0.8, 0.8), 1),
+    ("hard", "Hard Edge", (0.0, 0.75, 1.0), 3),
+    ("border", "Border Edge", (1.0, 0.0, 0.0), 6),
+    ("boundary", "Boundary Edge", (1.0, 0.0, 0.0), 6),
+    ("crease", "Crease Edge", (1.0, 1.0, 0.0), 2),
+    ("fold", "Fold Edge", (0.75, 0.75, 0.0), 2),
+]
+
+
+def _edge_control_name(edge_key, suffix):
+    # type: (Text, Text) -> Text
+    return "{}Edge{}".format(edge_key, suffix)
+
+
+def _create_edge_appearance_row(edge_key, label, color, width, slider_width):
+    # type: (Text, Text, Tuple[float, float, float], int, int) -> None
+    row_name = _edge_control_name(edge_key, "AppearanceRow")
+    swatch_name = _edge_control_name(edge_key, "ColorSwatch")
+    width_field_name = _edge_control_name(edge_key, "WidthField")
+    width_slider_name = _edge_control_name(edge_key, "WidthSlider")
+
+    cmds.rowLayout(
+        row_name,
+        numberOfColumns=5,
+        adjustableColumn=5,
+        columnAlign5=("right", "left", "right", "left", "left"),
+        columnAttach5=("both", "both", "both", "both", "both"),
+        columnWidth5=(120, 36, 42, 42, slider_width),
+    )
+    cmds.text(label=label + ":", align="right")
+    cmds.button(
+        swatch_name,
+        label="",
+        height=20,
+        backgroundColor=color,
+        command=lambda *_args: _pick_edge_color(edge_key),
+    )
+    cmds.text(label="Width", align="right")
+    cmds.intField(
+        width_field_name,
+        minValue=1,
+        maxValue=100,
+        value=width,
+        changeCommand=lambda value, key=edge_key: _sync_width_from_field(key, value),
+    )
+    cmds.intSlider(
+        width_slider_name,
+        min=1,
+        max=100,
+        value=width,
+        step=1,
+        dragCommand=lambda value, key=edge_key: _sync_width_from_slider(key, value),
+        changeCommand=lambda value, key=edge_key: _sync_width_from_slider(key, value),
+    )
+    cmds.setParent("..")
+
+
+def _pick_edge_color(edge_key):
+    # type: (Text) -> None
+    swatch_name = _edge_control_name(edge_key, "ColorSwatch")
+    current_color = cmds.button(swatch_name, query=True, backgroundColor=True)
+    cmds.colorEditor(rgbValue=current_color)
+    if cmds.colorEditor(query=True, result=True):
+        color = cmds.colorEditor(query=True, rgb=True)
+        cmds.button(swatch_name, edit=True, backgroundColor=color)
+
+
+def _get_edge_color(edge_key):
+    # type: (Text) -> Tuple[float, float, float]
+    return tuple(cmds.button(
+        _edge_control_name(edge_key, "ColorSwatch"),
+        query=True,
+        backgroundColor=True,
+    ))
+
+
+def _get_edge_width(edge_key):
+    # type: (Text) -> int
+    return int(cmds.intField(
+        _edge_control_name(edge_key, "WidthField"),
+        query=True,
+        value=True,
+    ))
+
+
+def _sync_width_from_slider(edge_key, value):
+    # type: (Text, int) -> None
+    cmds.intField(
+        _edge_control_name(edge_key, "WidthField"),
+        edit=True,
+        value=int(value),
+    )
+
+
+def _sync_width_from_field(edge_key, value):
+    # type: (Text, int) -> None
+    value = max(1, min(100, int(value)))
+    cmds.intField(
+        _edge_control_name(edge_key, "WidthField"),
+        edit=True,
+        value=value,
+    )
+    cmds.intSlider(
+        _edge_control_name(edge_key, "WidthSlider"),
+        edit=True,
+        value=value,
+    )
+
+
+def _set_edge_row_visible(edge_key, visible):
+    # type: (Text, bool) -> None
+    cmds.rowLayout(
+        _edge_control_name(edge_key, "AppearanceRow"),
+        edit=True,
+        visible=visible,
+    )
+
 
 def show_ui():
     # type: () -> None
@@ -96,23 +214,11 @@ def show_ui():
     cmds.checkBoxGrp("exportFoldEdge", label="", label1="Fold Edge", value1=False)
 
     cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501
-    
-    # Edge Color controls
-    cmds.colorSliderGrp("softEdgeColor", label="Soft Edge Color:", rgb=(0.8, 0.8, 0.8))
-    cmds.colorSliderGrp("hardEdgeColor", label="Hard Edge Color:", rgb=(0.0, 0.75, 1.0))
-    cmds.colorSliderGrp("borderEdgeColor", label="Border Edge Color:", rgb=(1, 0, 0))
-    cmds.colorSliderGrp("boundaryEdgeColor", label="Boundary Edge Color:", rgb=(1, 0, 0))
-    cmds.colorSliderGrp("creaseEdgeColor", label="Crease Edge Color:", rgb=(1, 1, 0))
-    cmds.colorSliderGrp("foldEdgeColor", label="Fold Edge Color:", rgb=(0.75, 0.75, 0))
-    cmds.separator(h=10)
 
-    # Edge Width controls
-    cmds.intSliderGrp("softEdgeWidth", label="Soft Edge Line Width:", field=True, min=1, max=100, value=1)
-    cmds.intSliderGrp("hardEdgeWidth", label="Hard Edge Line Width:", field=True, min=1, max=100, value=3)
-    cmds.intSliderGrp("borderEdgeWidth", label="Border Edge Line Width:", field=True, min=1, max=100, value=6)
-    cmds.intSliderGrp("boundaryEdgeWidth", label="Boundary Edge Line Width:", field=True, min=1, max=100, value=6)
-    cmds.intSliderGrp("creaseEdgeWidth", label="Crease Edge Line Width:", field=True, min=1, max=100, value=2)
-    cmds.intSliderGrp("foldEdgeWidth", label="Fold Edge Line Width:", field=True, min=1, max=100, value=2)
+    slider_width = gOptionBoxTemplateTextColumnWidth + gOptionBoxTemplateSliderWidgetWidth + 72
+    for edge_key, label, color, width in EDGE_APPEARANCE_SPECS:
+        _create_edge_appearance_row(edge_key, label, color, width, slider_width)
+
     cmds.setParent("..")  # End the frameLayout
 
     # UV Area Settings
@@ -226,24 +332,12 @@ def update_controls(*args):
     crease_edge_state = cmds.checkBoxGrp("exportCreaseEdge", query=True, value1=True)
     fold_edge_state = cmds.checkBoxGrp("exportFoldEdge", query=True, value1=True)
 
-    # Enable or disable the color and width controls based on the checkbox states
-    cmds.colorSliderGrp("softEdgeColor", edit=True, visible=soft_edge_state)
-    cmds.intSliderGrp("softEdgeWidth", edit=True, visible=soft_edge_state)
-    
-    cmds.colorSliderGrp("hardEdgeColor", edit=True, visible=hard_edge_state)
-    cmds.intSliderGrp("hardEdgeWidth", edit=True, visible=hard_edge_state)
-    
-    cmds.colorSliderGrp("borderEdgeColor", edit=True, visible=border_edge_state)
-    cmds.intSliderGrp("borderEdgeWidth", edit=True, visible=border_edge_state)
-    
-    cmds.colorSliderGrp("boundaryEdgeColor", edit=True, visible=boundary_edge_state)
-    cmds.intSliderGrp("boundaryEdgeWidth", edit=True, visible=boundary_edge_state)
-    
-    cmds.colorSliderGrp("creaseEdgeColor", edit=True, visible=crease_edge_state)
-    cmds.intSliderGrp("creaseEdgeWidth", edit=True, visible=crease_edge_state)
-    
-    cmds.colorSliderGrp("foldEdgeColor", edit=True, visible=fold_edge_state)
-    cmds.intSliderGrp("foldEdgeWidth", edit=True, visible=fold_edge_state)
+    _set_edge_row_visible("soft", soft_edge_state)
+    _set_edge_row_visible("hard", hard_edge_state)
+    _set_edge_row_visible("border", border_edge_state)
+    _set_edge_row_visible("boundary", boundary_edge_state)
+    _set_edge_row_visible("crease", crease_edge_state)
+    _set_edge_row_visible("fold", fold_edge_state)
 
 
 def get_uv_min_max():
@@ -291,19 +385,19 @@ def snapshot():
     fold_edge = cmds.checkBoxGrp("exportFoldEdge", query=True, value1=True)
     fold_angle = cmds.intSliderGrp("foldAngle", query=True, value=True)
 
-    soft_edge_color = cmds.colorSliderGrp("softEdgeColor", query=True, rgbValue=True)
-    hard_edge_color = cmds.colorSliderGrp("hardEdgeColor", query=True, rgbValue=True)
-    border_edge_color = cmds.colorSliderGrp("borderEdgeColor", query=True, rgbValue=True)
-    boundary_edge_color = cmds.colorSliderGrp("boundaryEdgeColor", query=True, rgbValue=True)
-    crease_edge_color = cmds.colorSliderGrp("creaseEdgeColor", query=True, rgbValue=True)
-    fold_edge_color = cmds.colorSliderGrp("foldEdgeColor", query=True, rgbValue=True)
+    soft_edge_color = _get_edge_color("soft")
+    hard_edge_color = _get_edge_color("hard")
+    border_edge_color = _get_edge_color("border")
+    boundary_edge_color = _get_edge_color("boundary")
+    crease_edge_color = _get_edge_color("crease")
+    fold_edge_color = _get_edge_color("fold")
 
-    soft_edge_width = cmds.intSliderGrp("softEdgeWidth", query=True, value=True)
-    hard_edge_width = cmds.intSliderGrp("hardEdgeWidth", query=True, value=True)
-    border_edge_width = cmds.intSliderGrp("borderEdgeWidth", query=True, value=True)
-    boundary_edge_width = cmds.intSliderGrp("boundaryEdgeWidth", query=True, value=True)
-    crease_edge_width = cmds.intSliderGrp("creaseEdgeWidth", query=True, value=True)
-    fold_edge_width = cmds.intSliderGrp("foldEdgeWidth", query=True, value=True)
+    soft_edge_width = _get_edge_width("soft")
+    hard_edge_width = _get_edge_width("hard")
+    border_edge_width = _get_edge_width("border")
+    boundary_edge_width = _get_edge_width("boundary")
+    crease_edge_width = _get_edge_width("crease")
+    fold_edge_width = _get_edge_width("fold")
 
     config = drawer.EdgeLineDrawerConfig()
     config.update_settings("soft", soft_edge, soft_edge_color, soft_edge_width)
