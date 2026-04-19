@@ -769,6 +769,13 @@ def _build_snapshot_json(settings, width_scale=1.0):
             profile_phases = {}
             payload_data.profile_phases = profile_phases
         profile_phases["collect_snapshots"] = snapshot_elapsed
+        topology_phase_totals = {}
+        for snapshot in snapshots:
+            build_profile = getattr(snapshot, "build_profile", None) or {}
+            for name, elapsed in build_profile.items():
+                topology_phase_totals[name] = topology_phase_totals.get(name, 0.0) + float(elapsed)
+        for name, elapsed in topology_phase_totals.items():
+            profile_phases["collect_snapshots_{}".format(name)] = elapsed
         profile_phases["end_to_end_accounted"] = profile_phases.get("total", 0.0) + snapshot_elapsed
     return payload_data, None
 

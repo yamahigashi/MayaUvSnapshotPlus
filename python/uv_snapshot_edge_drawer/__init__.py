@@ -110,13 +110,14 @@ class FoldCandidate(object):
 class MeshTopologySnapshot(object):
     """Cacheable topology-derived UV data for a mesh and UV set."""
 
-    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons):
-        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon]) -> None
+    def __init__(self, mesh_name, uv_set_name, edge_lines, fold_candidates, polygons, build_profile=None):
+        # type: (Text, Text, Dict[Text, List[EdgeLine]], List[FoldCandidate], List[UVPolygon], Optional[Dict[Text, float]]) -> None
         self.mesh_name = mesh_name
         self.uv_set_name = uv_set_name
         self.edge_lines = edge_lines
         self.fold_candidates = fold_candidates
         self.polygons = polygons
+        self.build_profile = dict(build_profile or {})
 
     def get_edge_lines(self, fold_angle):
         # type: (float) -> Dict[Text, List[EdgeLine]]
@@ -211,6 +212,13 @@ class MeshTopologyBuildSession(object):
         self.fold_candidates = []
         self.polygons = []
         self.phase = "crease"
+        self.phase_timings = {
+            "crease": 0.0,
+            "border": 0.0,
+            "edges": 0.0,
+            "faces": 0.0,
+            "finalize": 0.0,
+        }
         self.crease_index = 0
         self.border_index = 0
         self.it_vert = om.MItMeshVertex(self.fn_mesh.object())
@@ -239,33 +247,49 @@ class MeshTopologyBuildSession(object):
 
         while processed < max_items and time.perf_counter() < deadline and not self.done:
             if self.phase == "crease":
+                phase_started = time.perf_counter()
                 if self.crease_index >= len(self.crease_ids):
+                    self.phase_timings["crease"] += time.perf_counter() - phase_started
                     self.phase = "border"
                     continue
                 edge_id = self.crease_ids[self.crease_index]
                 self.crease_index += 1
                 self.it_edge.setIndex(edge_id)
                 self.crease_edges.extend(get_current_edge_line(self.fn_mesh, self.it_vert, self.it_edge, self.uv_set_name))
+                self.phase_timings["crease"] += time.perf_counter() - phase_started
                 processed += 1
                 continue
 
             if self.phase == "border":
+                phase_started = time.perf_counter()
                 if self.border_index >= len(self.border_ids):
+                    self.phase_timings["border"] += time.perf_counter() - phase_started
                     self.phase = "edges"
                     continue
                 edge_id = self.border_ids[self.border_index]
                 self.border_index += 1
                 self.it_edge.setIndex(edge_id)
                 self.border_edges.extend(get_current_edge_line(self.fn_mesh, self.it_vert, self.it_edge, self.uv_set_name))
+                self.phase_timings["border"] += time.perf_counter() - phase_started
                 processed += 1
                 continue
 
             if self.phase == "edges":
+                phase_started = time.perf_counter()
                 if self.it_edge.isDone():
+                    self.phase_timings["edges"] += time.perf_counter() - phase_started
                     self.phase = "faces"
                     continue
 
-                lines = get_current_edge_line(self.fn_mesh, self.it_vert, self.it_edge, self.uv_set_name)
+                connected_ids = list(self.it_edge.getConnectedFaces())
+                face_lines = get_current_edge_lines_for_faces(
+                    self.fn_mesh,
+                    self.it_vert,
+                    self.it_edge,
+                    self.uv_set_name,
+                    connected_ids,
+                )
+                lines = [line for _face_id, line in face_lines]
                 if not self.it_edge.isSmooth:
                     self.hard_edges_uvs.extend(lines)
                 else:
@@ -274,10 +298,9 @@ class MeshTopologyBuildSession(object):
                 if self.it_edge.onBoundary():
                     self.boundary_edges.extend(lines)
 
-                if self.it_edge.numConnectedFaces() >= 2:
-                    connected_ids = self.it_edge.getConnectedFaces()
-                    face_id1 = connected_ids[0]
-                    face_id2 = connected_ids[1]
+                if len(face_lines) >= 2:
+                    face_id1 = face_lines[0][0]
+                    face_id2 = face_lines[1][0]
 
                     self.it_face_normals.setIndex(face_id1)
                     norm1 = self.it_face_normals.getNormal()
@@ -286,18 +309,22 @@ class MeshTopologyBuildSession(object):
                     norm2 = self.it_face_normals.getNormal()
 
                     angle = norm1.angle(norm2)
-                    candidate_lines = []
-                    candidate_lines.extend(get_current_edge_line(self.fn_mesh, self.it_vert, self.it_edge, self.uv_set_name, face_id1))
-                    candidate_lines.extend(get_current_edge_line(self.fn_mesh, self.it_vert, self.it_edge, self.uv_set_name, face_id2))
-                    if candidate_lines:
-                        self.fold_candidates.append(FoldCandidate(angle, candidate_lines))
+                    self.fold_candidates.append(
+                        FoldCandidate(
+                            angle,
+                            [face_lines[0][1], face_lines[1][1]],
+                        )
+                    )
 
                 self.it_edge.next()
+                self.phase_timings["edges"] += time.perf_counter() - phase_started
                 processed += 1
                 continue
 
             if self.phase == "faces":
+                phase_started = time.perf_counter()
                 if self.it_face_polygons.isDone():
+                    self.phase_timings["faces"] += time.perf_counter() - phase_started
                     self.phase = "finalize"
                     continue
 
@@ -316,10 +343,13 @@ class MeshTopologyBuildSession(object):
                     self.polygons.append(UVPolygon(deduped))
 
                 self.it_face_polygons.next()
+                self.phase_timings["faces"] += time.perf_counter() - phase_started
                 processed += 1
                 continue
 
+            phase_started = time.perf_counter()
             self._finalize()
+            self.phase_timings["finalize"] += time.perf_counter() - phase_started
 
         return self.done
 
@@ -341,10 +371,13 @@ class MeshTopologyBuildSession(object):
             },
             self.fold_candidates,
             self.polygons,
+            build_profile=self.phase_timings,
         )
         _MESH_TOPOLOGY_CACHE[self.cache_key] = snapshot
         _register_mesh_dirty_callback(self.fn_mesh)
         _profile_log("mesh topology build {}".format(self.mesh_name), self.started_at)
+        if PROFILE_ENABLED:
+            print("uv_snapshot_edge_drawer: mesh topology phases {}".format(json.dumps(self.phase_timings, sort_keys=True)))
         self.done = True
 
 
@@ -645,18 +678,8 @@ def get_current_uv_set_id(fn_mesh):
     return current_set_id
 
 
-def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
-    # type: (om.MFnMesh, om.MItMeshVertex, om.MItMeshEdge, str, Optional[int]) -> List[EdgeLine]
-    """Get the edge line of the current iterators"""
-
-    if face_id is None:
-        res = []
-        conncetded_ids = it_edge.getConnectedFaces()
-        for face_id in conncetded_ids:
-            res.extend(get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id))  # noqa: E501
-
-        return res
-
+def _get_current_edge_line_for_face(it_vert, it_edge, uv_set_name, face_id):
+    # type: (om.MItMeshVertex, om.MItMeshEdge, str, int) -> Optional[EdgeLine]
     vert1 = it_edge.vertexId(0)
     vert2 = it_edge.vertexId(1)
 
@@ -667,10 +690,32 @@ def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
     uv2 = it_vert.getUV(face_id, uv_set_name)
 
     if uv1 == uv2:
+        return None
+
+    return EdgeLine(it_edge.index(), uv1, uv2)
+
+
+def get_current_edge_lines_for_faces(fn_mesh, it_vert, it_edge, uv_set_name, face_ids):
+    # type: (om.MFnMesh, om.MItMeshVertex, om.MItMeshEdge, str, Iterable[int]) -> List[Tuple[int, EdgeLine]]
+    del fn_mesh
+    lines = []
+    for face_id in face_ids:
+        line = _get_current_edge_line_for_face(it_vert, it_edge, uv_set_name, int(face_id))
+        if line is not None:
+            lines.append((int(face_id), line))
+    return lines
+
+
+def get_current_edge_line(fn_mesh, it_vert, it_edge, uv_set_name, face_id=None):
+    # type: (om.MFnMesh, om.MItMeshVertex, om.MItMeshEdge, str, Optional[int]) -> List[EdgeLine]
+    """Get the edge line of the current iterators"""
+
+    if face_id is None:
+        return [line for _face_id, line in get_current_edge_lines_for_faces(fn_mesh, it_vert, it_edge, uv_set_name, it_edge.getConnectedFaces())]
+
+    line = _get_current_edge_line_for_face(it_vert, it_edge, uv_set_name, face_id)
+    if line is None:
         return []
-
-    line = EdgeLine(it_edge.index(), uv1, uv2)
-
     return [line]
 
 
