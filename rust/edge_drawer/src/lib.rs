@@ -2355,6 +2355,74 @@ fn compact_payload_from_buffers(
     })
 }
 
+fn build_polygon_buffers_from_indexed_uvs(
+    face_uv_counts: &[usize],
+    face_uv_ids: &[usize],
+    all_us: &[f32],
+    all_vs: &[f32],
+) -> Result<(Vec<usize>, Vec<f32>), BoxError> {
+    if all_us.len() != all_vs.len() {
+        return Err("UV coordinate arrays must have the same length".into());
+    }
+    if face_uv_counts.is_empty() {
+        return Ok((vec![0], Vec::new()));
+    }
+
+    let mut polygon_offsets = Vec::with_capacity(face_uv_counts.len() + 1);
+    let mut polygon_points = Vec::with_capacity(face_uv_ids.len() * 2);
+    polygon_offsets.push(0);
+
+    let mut uv_index = 0usize;
+    for &face_uv_count in face_uv_counts {
+        if face_uv_count == 0 {
+            continue;
+        }
+
+        let next_uv_index = uv_index + face_uv_count;
+        if next_uv_index > face_uv_ids.len() {
+            return Err("face_uv_counts exceed face_uv_ids length".into());
+        }
+
+        let start_len = polygon_points.len();
+        let mut deduped_point_count = 0usize;
+        let mut previous = None::<(f32, f32)>;
+        let mut first = None::<(f32, f32)>;
+
+        for &uv_id in &face_uv_ids[uv_index..next_uv_index] {
+            let Some((&u, &v)) = all_us.get(uv_id).zip(all_vs.get(uv_id)) else {
+                return Err("face_uv_ids contain an out-of-range UV index".into());
+            };
+
+            if previous == Some((u, v)) {
+                continue;
+            }
+            if deduped_point_count == 0 {
+                first = Some((u, v));
+            }
+            polygon_points.push(u);
+            polygon_points.push(v);
+            previous = Some((u, v));
+            deduped_point_count += 1;
+        }
+
+        if deduped_point_count >= 3 && previous == first {
+            polygon_points.truncate(polygon_points.len() - 2);
+            deduped_point_count -= 1;
+        }
+
+        if deduped_point_count < 3 {
+            polygon_points.truncate(start_len);
+        } else {
+            let point_count = *polygon_offsets.last().unwrap() + deduped_point_count;
+            polygon_offsets.push(point_count);
+        }
+
+        uv_index = next_uv_index;
+    }
+
+    Ok((polygon_offsets, polygon_points))
+}
+
 #[pyfunction(name = "draw_edges")]
 fn draw_edges_py(image_path: &str, width: u32, height: u32, edges_json: &str) -> PyResult<()> {
     draw_to_path(Path::new(image_path), width, height, edges_json)
@@ -2419,10 +2487,22 @@ fn draw_edges_buffered_py(
     }
 }
 
+#[pyfunction(name = "build_polygon_buffers")]
+fn build_polygon_buffers_py(
+    face_uv_counts: Vec<usize>,
+    face_uv_ids: Vec<usize>,
+    all_us: Vec<f32>,
+    all_vs: Vec<f32>,
+) -> PyResult<(Vec<usize>, Vec<f32>)> {
+    build_polygon_buffers_from_indexed_uvs(&face_uv_counts, &face_uv_ids, &all_us, &all_vs)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+}
+
 #[pymodule(name = "_edge_drawer")]
 fn _edge_drawer(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(draw_edges_py, module)?)?;
     module.add_function(wrap_pyfunction!(draw_edges_buffered_py, module)?)?;
+    module.add_function(wrap_pyfunction!(build_polygon_buffers_py, module)?)?;
     Ok(())
 }
 
@@ -2621,6 +2701,34 @@ mod tests {
                 points: vec![[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]],
             },
         ]
+    }
+
+    #[test]
+    fn build_polygon_buffers_dedupes_consecutive_points_and_closing_duplicate() {
+        let (offsets, points) = build_polygon_buffers_from_indexed_uvs(
+            &[5],
+            &[0, 1, 1, 2, 0],
+            &[0.0, 1.0, 1.0],
+            &[0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        assert_eq!(offsets, vec![0, 3]);
+        assert_eq!(points, vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn build_polygon_buffers_discards_degenerate_faces() {
+        let (offsets, points) = build_polygon_buffers_from_indexed_uvs(
+            &[2, 3],
+            &[0, 1, 0, 1, 2],
+            &[0.0, 1.0, 1.0],
+            &[0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        assert_eq!(offsets, vec![0, 3]);
+        assert_eq!(points, vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]

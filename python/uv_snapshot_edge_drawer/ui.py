@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """ Draw edge lines on UV Snapshot images"""
+import json
 import os
 import sys
 import tempfile
