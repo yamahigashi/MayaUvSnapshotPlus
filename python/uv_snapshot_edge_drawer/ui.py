@@ -556,10 +556,10 @@ def _build_snapshot_json(settings, width_scale=1.0):
     if padding_warning is not None:
         payload["padding_warning"] = padding_warning
 
-    json_data = drawer.edges_to_json_string(payload)
+    payload_data = drawer.build_drawer_payload_buffers(payload)
     if drawer.PROFILE_ENABLED:
-        print("uv_snapshot_edge_drawer: build snapshot json {:.4f}s".format(time.time() - started_at))
-    return json_data, None
+        print("uv_snapshot_edge_drawer: build snapshot payload {:.4f}s".format(time.time() - started_at))
+    return payload_data, None
 
 
 def _get_preview_dimensions(settings):

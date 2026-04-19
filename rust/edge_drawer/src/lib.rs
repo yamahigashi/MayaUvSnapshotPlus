@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -112,13 +113,22 @@ struct DirectedEdge {
 struct PreparedGroup {
     line_width: f32,
     line_color: [u8; 4],
-    is_overlay: bool,
     paths: Vec<Vec<QPoint>>,
 }
 
 #[derive(Clone, Debug)]
 struct PreparedDrawing {
     groups: Vec<PreparedGroup>,
+}
+
+#[derive(Clone, Debug)]
+struct DrawStyle {
+    internal_width: f32,
+    outline_width: f32,
+    internal_color: [u8; 4],
+    outline_color: [u8; 4],
+    draw_outline: bool,
+    draw_internal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +145,16 @@ struct SegmentArrangement {
     group_segments: Vec<Vec<CanonicalSegment>>,
 }
 
+#[derive(Clone, Debug)]
+struct CompactPayload {
+    styles: Vec<DrawStyle>,
+    arrangement_input_segments: Vec<CanonicalSegment>,
+    arrangement_input_group_segments: Vec<Vec<CanonicalSegment>>,
+    point_positions: HashMap<QPoint, [f32; 2]>,
+    polygons: Vec<Polygon>,
+    padding_warning: Option<PaddingWarningConfig>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SegmentBounds {
     min: [f32; 2],
@@ -143,7 +163,61 @@ struct SegmentBounds {
 
 #[derive(Clone, Debug)]
 struct UniformGridIndex {
+    min: [f32; 2],
+    cell_size: [f32; 2],
+    resolution: u32,
     cells: HashMap<(i32, i32), Vec<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct IndexedPolygon {
+    points: Vec<[f32; 2]>,
+    bounds: SegmentBounds,
+}
+
+#[derive(Clone, Debug)]
+struct PolygonIndex {
+    polygons: Vec<IndexedPolygon>,
+    grid: UniformGridIndex,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SamplePointKey {
+    x: i64,
+    y: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum BucketKind {
+    Internal,
+    Outline,
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StyleBucketKey {
+    kind: BucketKind,
+    line_width_bits: u32,
+    line_color: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
+struct StyleBucket {
+    line_width: f32,
+    line_color: [u8; 4],
+    segments: Vec<SegmentInfo>,
+}
+
+fn profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn log_profile(label: &str, started_at: Instant) {
+    if profile_enabled() {
+        eprintln!("edge_drawer: {} {:.4}s", label, started_at.elapsed().as_secs_f64());
+    }
 }
 
 fn default_padding_pixels() -> f32 {
@@ -234,6 +308,7 @@ pub fn draw_to_path_from_payload(
     height: u32,
     payload: &DrawerPayload,
 ) -> Result<(), BoxError> {
+    let prepare_started_at = Instant::now();
     let prepared = prepare_drawing(
         &payload.edges,
         &payload.polygons,
@@ -241,12 +316,17 @@ pub fn draw_to_path_from_payload(
         height,
         payload.padding_warning.as_ref(),
     );
+    log_profile("prepare_total", prepare_started_at);
 
     if image_path.extension().and_then(|s| s.to_str()) == Some("svg") {
+        let render_started_at = Instant::now();
         let document = draw_edges_svg(&prepared, width, height);
+        log_profile("render_svg", render_started_at);
         save_svg(&document, image_path)?;
     } else {
+        let render_started_at = Instant::now();
         let pixmap = draw_edges_raster(&prepared, width, height)?;
+        log_profile("render_raster", render_started_at);
         save_image(&pixmap, image_path)?;
     }
 
@@ -278,9 +358,27 @@ fn prepare_drawing(
     height: u32,
     padding_warning: Option<&PaddingWarningConfig>,
 ) -> PreparedDrawing {
+    let arrangement_started_at = Instant::now();
+    let styles = edges
+        .iter()
+        .map(|group| DrawStyle {
+            internal_width: group.effective_internal_width().max(0.0),
+            outline_width: group.effective_outline_width().max(0.0),
+            internal_color: group.effective_internal_color(),
+            outline_color: group.effective_outline_color(),
+            draw_outline: group.effective_draw_outline(),
+            draw_internal: group.effective_draw_internal(),
+        })
+        .collect::<Vec<_>>();
     let arrangement = build_segment_arrangement(edges);
+    log_profile("arrangement", arrangement_started_at);
+
+    let classification_started_at = Instant::now();
     let (internal_segments, outline_segments) =
         classify_segments(&arrangement.segments, &arrangement.point_positions, polygons);
+    log_profile("classification", classification_started_at);
+
+    let warning_started_at = Instant::now();
     let warning_segments = detect_padding_warning_segments(
         &outline_segments,
         &arrangement.point_positions,
@@ -288,25 +386,94 @@ fn prepare_drawing(
         height,
         padding_warning,
     );
-    let mut groups = Vec::new();
-    let mut overlay_groups = Vec::new();
-    for (group, group_segments) in edges.iter().zip(arrangement.group_segments.iter()) {
-        for prepared_group in build_prepared_groups(
-            group,
+    log_profile("warning", warning_started_at);
+
+    let path_started_at = Instant::now();
+    let mut normal_bucket_order = Vec::new();
+    let mut overlay_bucket_order = Vec::new();
+    let mut normal_buckets = HashMap::new();
+    let mut overlay_buckets = HashMap::new();
+
+    for (style, group_segments) in styles.iter().zip(arrangement.group_segments.iter()) {
+        append_bucket_segments(
+            style,
             group_segments,
             &internal_segments,
             &outline_segments,
             &warning_segments,
             padding_warning,
-        ) {
-            if prepared_group.is_overlay {
-                overlay_groups.push(prepared_group);
-            } else {
-                groups.push(prepared_group);
-            }
-        }
+            &mut normal_buckets,
+            &mut normal_bucket_order,
+            &mut overlay_buckets,
+            &mut overlay_bucket_order,
+        );
     }
-    groups.extend(overlay_groups);
+
+    let mut groups = materialize_style_buckets(&normal_bucket_order, &mut normal_buckets);
+    groups.extend(materialize_style_buckets(
+        &overlay_bucket_order,
+        &mut overlay_buckets,
+    ));
+    log_profile("path_build", path_started_at);
+
+    PreparedDrawing { groups }
+}
+
+fn prepare_drawing_from_compact(
+    payload: &CompactPayload,
+    width: u32,
+    height: u32,
+) -> PreparedDrawing {
+    let arrangement_started_at = Instant::now();
+    let arrangement = build_segment_arrangement_from_parts(
+        payload.arrangement_input_segments.clone(),
+        payload.point_positions.clone(),
+        &payload.arrangement_input_group_segments,
+    );
+    log_profile("arrangement", arrangement_started_at);
+
+    let classification_started_at = Instant::now();
+    let (internal_segments, outline_segments) =
+        classify_segments(&arrangement.segments, &arrangement.point_positions, &payload.polygons);
+    log_profile("classification", classification_started_at);
+
+    let warning_started_at = Instant::now();
+    let warning_segments = detect_padding_warning_segments(
+        &outline_segments,
+        &arrangement.point_positions,
+        width,
+        height,
+        payload.padding_warning.as_ref(),
+    );
+    log_profile("warning", warning_started_at);
+
+    let path_started_at = Instant::now();
+    let mut normal_bucket_order = Vec::new();
+    let mut overlay_bucket_order = Vec::new();
+    let mut normal_buckets = HashMap::new();
+    let mut overlay_buckets = HashMap::new();
+
+    for (style, group_segments) in payload.styles.iter().zip(arrangement.group_segments.iter()) {
+        append_bucket_segments(
+            style,
+            group_segments,
+            &internal_segments,
+            &outline_segments,
+            &warning_segments,
+            payload.padding_warning.as_ref(),
+            &mut normal_buckets,
+            &mut normal_bucket_order,
+            &mut overlay_buckets,
+            &mut overlay_bucket_order,
+        );
+    }
+
+    let mut groups = materialize_style_buckets(&normal_bucket_order, &mut normal_buckets);
+    groups.extend(materialize_style_buckets(
+        &overlay_bucket_order,
+        &mut overlay_buckets,
+    ));
+    log_profile("path_build", path_started_at);
 
     PreparedDrawing { groups }
 }
@@ -327,20 +494,36 @@ fn collect_point_positions(edges: &[Edges]) -> HashMap<QPoint, [f32; 2]> {
 }
 
 fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
-    let mut point_positions = collect_point_positions(edges);
+    let point_positions = collect_point_positions(edges);
     let original_segments = collect_unique_segments(edges);
-    let mut split_points: HashMap<CanonicalSegment, HashSet<QPoint>> = HashMap::new();
+    let mut group_segments = Vec::with_capacity(edges.len());
+    for group in edges {
+        let mut group_set = HashSet::new();
+        for line in &group.lines {
+            let Some(original) = canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
+            else {
+                continue;
+            };
+            group_set.insert(original);
+        }
+        let mut parts = group_set.into_iter().collect::<Vec<_>>();
+        parts.sort_by_key(|segment| (segment.start, segment.end));
+        group_segments.push(parts);
+    }
+
+    build_segment_arrangement_from_parts(original_segments, point_positions, &group_segments)
+}
+
+fn build_segment_arrangement_from_parts(
+    original_segments: Vec<CanonicalSegment>,
+    mut point_positions: HashMap<QPoint, [f32; 2]>,
+    original_group_segments: &[Vec<CanonicalSegment>],
+) -> SegmentArrangement {
+    let mut split_points: HashMap<CanonicalSegment, Vec<QPoint>> = HashMap::new();
     let segment_bounds = original_segments
         .iter()
         .map(|segment| segment_bounds_uv(*segment, &point_positions))
         .collect::<Vec<_>>();
-
-    for segment in &original_segments {
-        split_points
-            .entry(*segment)
-            .or_default()
-            .extend([segment.start, segment.end]);
-    }
 
     for (left_index, right_index) in collect_candidate_pairs(&segment_bounds, 0.0) {
         let left = original_segments[left_index];
@@ -353,15 +536,15 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
         for point in split_intersection_points(left_start, left_end, right_start, right_end) {
             let quantized = quantize_point(point);
             point_positions.entry(quantized).or_insert(point);
-            split_points.entry(left).or_default().insert(quantized);
-            split_points.entry(right).or_default().insert(quantized);
+            append_split_point(&mut split_points, left, quantized);
+            append_split_point(&mut split_points, right, quantized);
         }
     }
 
     let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> = HashMap::new();
     let mut segments_set = HashSet::new();
     for segment in &original_segments {
-        let parts = split_segment(*segment, &split_points[segment], &point_positions);
+        let parts = split_segment(*segment, split_points.get(segment), &point_positions);
         for part in &parts {
             segments_set.insert(*part);
         }
@@ -371,15 +554,11 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
     let mut segments = segments_set.into_iter().collect::<Vec<_>>();
     segments.sort_by_key(|segment| (segment.start, segment.end));
 
-    let mut group_segments = Vec::with_capacity(edges.len());
-    for group in edges {
+    let mut group_segments = Vec::with_capacity(original_group_segments.len());
+    for original_group in original_group_segments {
         let mut group_set = HashSet::new();
-        for line in &group.lines {
-            let Some(original) = canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
-            else {
-                continue;
-            };
-            if let Some(parts) = split_segments_by_original.get(&original) {
+        for original in original_group {
+            if let Some(parts) = split_segments_by_original.get(original) {
                 group_set.extend(parts.iter().copied());
             }
         }
@@ -392,6 +571,17 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
         segments,
         point_positions,
         group_segments,
+    }
+}
+
+fn append_split_point(
+    split_points: &mut HashMap<CanonicalSegment, Vec<QPoint>>,
+    segment: CanonicalSegment,
+    point: QPoint,
+) {
+    let points = split_points.entry(segment).or_default();
+    if !points.contains(&point) {
+        points.push(point);
     }
 }
 
@@ -418,7 +608,7 @@ fn split_intersection_points(
 
 fn split_segment(
     original: CanonicalSegment,
-    split_points: &HashSet<QPoint>,
+    split_points: Option<&Vec<QPoint>>,
     point_positions: &HashMap<QPoint, [f32; 2]>,
 ) -> Vec<CanonicalSegment> {
     let start = point_positions[&original.start];
@@ -429,7 +619,10 @@ fn split_segment(
         return Vec::new();
     }
 
-    let mut ordered = split_points.iter().copied().collect::<Vec<_>>();
+    let mut ordered = vec![original.start, original.end];
+    if let Some(split_points) = split_points {
+        ordered.extend(split_points.iter().copied());
+    }
     ordered.sort_by(|lhs, rhs| {
         segment_parameter(point_positions[lhs], start, end)
             .total_cmp(&segment_parameter(point_positions[rhs], start, end))
@@ -519,14 +712,18 @@ fn classify_warning_segments(
     )
 }
 
-fn build_prepared_groups(
-    group: &Edges,
+fn append_bucket_segments(
+    style: &DrawStyle,
     group_segments: &[CanonicalSegment],
     internal_segments: &HashSet<CanonicalSegment>,
     outline_segments_set: &HashSet<CanonicalSegment>,
     warning_segments: &HashSet<CanonicalSegment>,
     padding_warning: Option<&PaddingWarningConfig>,
-) -> Vec<PreparedGroup> {
+    normal_buckets: &mut HashMap<StyleBucketKey, StyleBucket>,
+    normal_bucket_order: &mut Vec<StyleBucketKey>,
+    overlay_buckets: &mut HashMap<StyleBucketKey, StyleBucket>,
+    overlay_bucket_order: &mut Vec<StyleBucketKey>,
+) {
     let mut outline_segments = Vec::new();
     let mut internal_only_segments = Vec::new();
 
@@ -536,31 +733,36 @@ fn build_prepared_groups(
             b: canonical.end,
         };
         if internal_segments.contains(&canonical) {
-            if group.effective_draw_internal() {
+            if style.draw_internal {
                 internal_only_segments.push(segment);
             }
-        } else if outline_segments_set.contains(&canonical) && group.effective_draw_outline() {
+        } else if outline_segments_set.contains(&canonical) && style.draw_outline {
             outline_segments.push(segment);
         }
     }
 
-    let mut prepared = Vec::new();
     if !internal_only_segments.is_empty() {
-        prepared.push(PreparedGroup {
-            line_width: group.effective_internal_width().max(0.0),
-            line_color: group.effective_internal_color(),
-            is_overlay: false,
-            paths: build_paths_from_segments(&internal_only_segments),
-        });
+        append_style_bucket(
+            normal_buckets,
+            normal_bucket_order,
+            BucketKind::Internal,
+            style.internal_width,
+            style.internal_color,
+            false,
+            &internal_only_segments,
+        );
     }
     if !outline_segments.is_empty() {
-        let outline_width = group.effective_outline_width().max(0.0);
-        prepared.push(PreparedGroup {
-            line_width: outline_width,
-            line_color: group.effective_outline_color(),
-            is_overlay: false,
-            paths: build_paths_from_segments(&outline_segments),
-        });
+        let outline_width = style.outline_width;
+        append_style_bucket(
+            normal_buckets,
+            normal_bucket_order,
+            BucketKind::Outline,
+            outline_width,
+            style.outline_color,
+            false,
+            &outline_segments,
+        );
 
         if padding_warning
             .map(|warning| warning.enabled)
@@ -577,21 +779,70 @@ fn build_prepared_groups(
                 .collect::<Vec<_>>();
 
             if !warned_outline_segments.is_empty() {
-                prepared.push(PreparedGroup {
-                    line_width: padding_warning
+                append_style_bucket(
+                    overlay_buckets,
+                    overlay_bucket_order,
+                    BucketKind::Overlay,
+                    padding_warning
                         .map(|warning| warning.warning_width.max(0.0))
                         .unwrap_or(outline_width),
-                    line_color: padding_warning
+                    padding_warning
                         .map(|warning| warning.warning_color)
                         .unwrap_or(DEFAULT_WARNING_COLOR),
-                    is_overlay: true,
-                    paths: build_paths_from_segments(&warned_outline_segments),
-                });
+                    true,
+                    &warned_outline_segments,
+                );
             }
         }
     }
+}
 
-    prepared
+fn append_style_bucket(
+    buckets: &mut HashMap<StyleBucketKey, StyleBucket>,
+    bucket_order: &mut Vec<StyleBucketKey>,
+    kind: BucketKind,
+    line_width: f32,
+    line_color: [u8; 4],
+    _is_overlay: bool,
+    segments: &[SegmentInfo],
+) {
+    let key = StyleBucketKey {
+        kind,
+        line_width_bits: line_width.to_bits(),
+        line_color,
+    };
+    if !buckets.contains_key(&key) {
+        bucket_order.push(key);
+        buckets.insert(
+            key,
+            StyleBucket {
+                line_width,
+                line_color,
+                segments: Vec::new(),
+            },
+        );
+    }
+    if let Some(bucket) = buckets.get_mut(&key) {
+        bucket.segments.extend_from_slice(segments);
+    }
+}
+
+fn materialize_style_buckets(
+    bucket_order: &[StyleBucketKey],
+    buckets: &mut HashMap<StyleBucketKey, StyleBucket>,
+) -> Vec<PreparedGroup> {
+    let mut groups = Vec::new();
+    for key in bucket_order {
+        let Some(bucket) = buckets.remove(key) else {
+            continue;
+        };
+        groups.push(PreparedGroup {
+            line_width: bucket.line_width,
+            line_color: bucket.line_color,
+            paths: build_paths_from_segments(&bucket.segments),
+        });
+    }
+    groups
 }
 
 fn collect_unique_segments(edges: &[Edges]) -> Vec<CanonicalSegment> {
@@ -619,15 +870,45 @@ fn default_grid_resolution(count: usize) -> u32 {
     target.next_power_of_two().clamp(16, 256)
 }
 
+fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2]) {
+    let mut min = [f32::INFINITY, f32::INFINITY];
+    let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+
+    for bounds in bounds {
+        min[0] = min[0].min(bounds.min[0] - expand);
+        min[1] = min[1].min(bounds.min[1] - expand);
+        max[0] = max[0].max(bounds.max[0] + expand);
+        max[1] = max[1].max(bounds.max[1] + expand);
+    }
+
+    if !min[0].is_finite() {
+        return ([0.0, 0.0], [1.0, 1.0]);
+    }
+
+    if (max[0] - min[0]).abs() <= f32::EPSILON {
+        max[0] = min[0] + 1.0;
+    }
+    if (max[1] - min[1]).abs() <= f32::EPSILON {
+        max[1] = min[1] + 1.0;
+    }
+
+    (min, max)
+}
+
 fn build_uniform_grid(bounds: &[SegmentBounds], expand: f32) -> UniformGridIndex {
     let resolution = default_grid_resolution(bounds.len());
+    let (min, max) = combine_bounds(bounds, expand);
+    let cell_size = [
+        (max[0] - min[0]) / resolution as f32,
+        (max[1] - min[1]) / resolution as f32,
+    ];
     let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
 
     for (idx, bounds) in bounds.iter().enumerate() {
-        let min_x = cell_coord(bounds.min[0] - expand, resolution);
-        let max_x = cell_coord(bounds.max[0] + expand, resolution);
-        let min_y = cell_coord(bounds.min[1] - expand, resolution);
-        let max_y = cell_coord(bounds.max[1] + expand, resolution);
+        let min_x = cell_coord(bounds.min[0] - expand, min[0], cell_size[0], resolution);
+        let max_x = cell_coord(bounds.max[0] + expand, min[0], cell_size[0], resolution);
+        let min_y = cell_coord(bounds.min[1] - expand, min[1], cell_size[1], resolution);
+        let max_y = cell_coord(bounds.max[1] + expand, min[1], cell_size[1], resolution);
 
         for x in min_x..=max_x {
             for y in min_y..=max_y {
@@ -636,7 +917,12 @@ fn build_uniform_grid(bounds: &[SegmentBounds], expand: f32) -> UniformGridIndex
         }
     }
 
-    UniformGridIndex { cells }
+    UniformGridIndex {
+        min,
+        cell_size,
+        resolution,
+        cells,
+    }
 }
 
 fn collect_candidate_pairs(bounds: &[SegmentBounds], expand: f32) -> Vec<(usize, usize)> {
@@ -644,29 +930,33 @@ fn collect_candidate_pairs(bounds: &[SegmentBounds], expand: f32) -> Vec<(usize,
         return Vec::new();
     }
 
-    let grid = build_uniform_grid(bounds, expand);
-    let mut pairs = HashSet::new();
+    let mut sorted_indices = (0..bounds.len()).collect::<Vec<_>>();
+    sorted_indices.sort_by(|lhs, rhs| {
+        bounds[*lhs].min[0]
+            .total_cmp(&bounds[*rhs].min[0])
+            .then_with(|| bounds[*lhs].max[0].total_cmp(&bounds[*rhs].max[0]))
+    });
 
-    for indices in grid.cells.values() {
-        for left_index in 0..indices.len() {
-            for right_index in (left_index + 1)..indices.len() {
-                let left = indices[left_index];
-                let right = indices[right_index];
-                let pair = if left < right {
-                    (left, right)
+    let mut active = Vec::<usize>::new();
+    let mut pairs = Vec::new();
+    for &current in &sorted_indices {
+        let current_min_x = bounds[current].min[0] - expand;
+        active.retain(|idx| bounds[*idx].max[0] + expand >= current_min_x);
+
+        for &candidate in &active {
+            if bounds_overlap(bounds[current], bounds[candidate], expand) {
+                let pair = if candidate < current {
+                    (candidate, current)
                 } else {
-                    (right, left)
+                    (current, candidate)
                 };
-
-                if bounds_overlap(bounds[pair.0], bounds[pair.1], expand) {
-                    pairs.insert(pair);
-                }
+                pairs.push(pair);
             }
         }
+
+        active.push(current);
     }
 
-    let mut pairs = pairs.into_iter().collect::<Vec<_>>();
-    pairs.sort_unstable();
     pairs
 }
 
@@ -677,8 +967,13 @@ fn bounds_overlap(left: SegmentBounds, right: SegmentBounds, expand: f32) -> boo
         && left.max[1] + expand >= right.min[1] - expand
 }
 
-fn cell_coord(value: f32, resolution: u32) -> i32 {
-    let scaled = (value.clamp(0.0, 1.0) * resolution as f32).floor() as i32;
+fn cell_coord(value: f32, min: f32, cell_size: f32, resolution: u32) -> i32 {
+    let normalized = if cell_size <= f32::EPSILON {
+        0.0
+    } else {
+        (value - min) / cell_size
+    };
+    let scaled = normalized.floor() as i32;
     scaled.clamp(0, resolution as i32 - 1)
 }
 
@@ -712,23 +1007,33 @@ fn build_canvas_grid(
     let resolution = default_grid_resolution(segments.len());
     let width_f = width.max(1) as f32;
     let height_f = height.max(1) as f32;
+    let min = [0.0, 0.0];
+    let cell_size = [
+        width_f / resolution as f32,
+        height_f / resolution as f32,
+    ];
     let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
 
     for (idx, segment) in segments.iter().enumerate() {
         let bounds = segment_bounds_canvas(*segment, width, height);
-        let min_x = (((bounds.min[0] - expand_pixels).max(0.0) / width_f) * resolution as f32).floor() as i32;
-        let max_x = (((bounds.max[0] + expand_pixels).min(width_f) / width_f) * resolution as f32).floor() as i32;
-        let min_y = (((bounds.min[1] - expand_pixels).max(0.0) / height_f) * resolution as f32).floor() as i32;
-        let max_y = (((bounds.max[1] + expand_pixels).min(height_f) / height_f) * resolution as f32).floor() as i32;
+        let min_x = cell_coord((bounds.min[0] - expand_pixels).max(0.0), 0.0, cell_size[0], resolution);
+        let max_x = cell_coord((bounds.max[0] + expand_pixels).min(width_f), 0.0, cell_size[0], resolution);
+        let min_y = cell_coord((bounds.min[1] - expand_pixels).max(0.0), 0.0, cell_size[1], resolution);
+        let max_y = cell_coord((bounds.max[1] + expand_pixels).min(height_f), 0.0, cell_size[1], resolution);
 
-        for x in min_x.clamp(0, resolution as i32 - 1)..=max_x.clamp(0, resolution as i32 - 1) {
-            for y in min_y.clamp(0, resolution as i32 - 1)..=max_y.clamp(0, resolution as i32 - 1) {
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
                 cells.entry((x, y)).or_default().push(idx);
             }
         }
     }
 
-    UniformGridIndex { cells }
+    UniformGridIndex {
+        min,
+        cell_size,
+        resolution,
+        cells,
+    }
 }
 
 fn detect_padding_warning_segments(
@@ -945,12 +1250,19 @@ fn classify_segments(
         return classify_segments_from_graph(unique_segments, point_positions);
     }
 
+    let polygon_index = build_polygon_index(polygons);
+    let mut sample_cache = HashMap::new();
     let mut internal_segments = HashSet::new();
     let mut outline_segments = HashSet::new();
 
     for &segment in unique_segments {
         let (left_inside, right_inside) =
-            segment_side_states_with_polygons(segment, polygons, point_positions);
+            segment_side_states_with_polygons(
+                segment,
+                &polygon_index,
+                point_positions,
+                &mut sample_cache,
+            );
         match (left_inside, right_inside) {
             (true, true) => {
                 internal_segments.insert(segment);
@@ -1004,8 +1316,9 @@ fn classify_segments_from_graph(
 
 fn segment_side_states_with_polygons(
     segment: CanonicalSegment,
-    polygons: &[Polygon],
+    polygon_index: &PolygonIndex,
     point_positions: &HashMap<QPoint, [f32; 2]>,
+    sample_cache: &mut HashMap<SamplePointKey, bool>,
 ) -> (bool, bool) {
     let a = point_positions[&segment.start];
     let b = point_positions[&segment.end];
@@ -1021,7 +1334,10 @@ fn segment_side_states_with_polygons(
     let left = [mid[0] + offset[0], mid[1] + offset[1]];
     let right = [mid[0] - offset[0], mid[1] - offset[1]];
 
-    (point_in_polygons(left, polygons), point_in_polygons(right, polygons))
+    (
+        point_in_polygons(left, polygon_index, sample_cache),
+        point_in_polygons(right, polygon_index, sample_cache),
+    )
 }
 
 fn segment_side_states(
@@ -1238,13 +1554,82 @@ fn point_in_faces(
     inside
 }
 
-fn point_in_polygons(point: [f32; 2], polygons: &[Polygon]) -> bool {
-    for polygon in polygons {
+fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
+    let indexed_polygons = polygons
+        .iter()
+        .map(|polygon| {
+            let mut min = [f32::INFINITY, f32::INFINITY];
+            let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+            for point in &polygon.points {
+                min[0] = min[0].min(point[0]);
+                min[1] = min[1].min(point[1]);
+                max[0] = max[0].max(point[0]);
+                max[1] = max[1].max(point[1]);
+            }
+            IndexedPolygon {
+                points: polygon.points.clone(),
+                bounds: SegmentBounds { min, max },
+            }
+        })
+        .collect::<Vec<_>>();
+    let bounds = indexed_polygons
+        .iter()
+        .map(|polygon| polygon.bounds)
+        .collect::<Vec<_>>();
+    let grid = build_uniform_grid(&bounds, 0.0);
+    PolygonIndex {
+        polygons: indexed_polygons,
+        grid,
+    }
+}
+
+fn sample_point_key(point: [f32; 2]) -> SamplePointKey {
+    SamplePointKey {
+        x: (point[0] * 1_000_000.0).round() as i64,
+        y: (point[1] * 1_000_000.0).round() as i64,
+    }
+}
+
+fn point_in_polygons(
+    point: [f32; 2],
+    polygon_index: &PolygonIndex,
+    sample_cache: &mut HashMap<SamplePointKey, bool>,
+) -> bool {
+    let key = sample_point_key(point);
+    if let Some(is_inside) = sample_cache.get(&key) {
+        return *is_inside;
+    }
+
+    let mut is_inside = false;
+    for &polygon_index_id in grid_candidates_for_point(&polygon_index.grid, point) {
+        let polygon = &polygon_index.polygons[polygon_index_id];
+        if !bounds_contains_point(polygon.bounds, point) {
+            continue;
+        }
         if point_in_polygon_points(point, &polygon.points) {
-            return true;
+            is_inside = true;
+            break;
         }
     }
-    false
+
+    sample_cache.insert(key, is_inside);
+    is_inside
+}
+
+fn grid_candidates_for_point(grid: &UniformGridIndex, point: [f32; 2]) -> &[usize] {
+    let x = cell_coord(point[0], grid.min[0], grid.cell_size[0], grid.resolution);
+    let y = cell_coord(point[1], grid.min[1], grid.cell_size[1], grid.resolution);
+    match grid.cells.get(&(x, y)) {
+        Some(indices) => indices.as_slice(),
+        None => &[],
+    }
+}
+
+fn bounds_contains_point(bounds: SegmentBounds, point: [f32; 2]) -> bool {
+    point[0] >= bounds.min[0] - AREA_EPSILON
+        && point[0] <= bounds.max[0] + AREA_EPSILON
+        && point[1] >= bounds.min[1] - AREA_EPSILON
+        && point[1] <= bounds.max[1] + AREA_EPSILON
 }
 
 fn point_in_polygon_points(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
@@ -1284,6 +1669,16 @@ fn point_in_polygon(
         previous = current;
     }
     inside
+}
+
+#[cfg(test)]
+fn point_in_polygons_bruteforce(point: [f32; 2], polygons: &[Polygon]) -> bool {
+    for polygon in polygons {
+        if point_in_polygon_points(point, &polygon.points) {
+            return true;
+        }
+    }
+    false
 }
 
 fn polygon_area(points: &[QPoint], point_positions: &HashMap<QPoint, [f32; 2]>) -> f32 {
@@ -1610,15 +2005,202 @@ fn to_canvas_point(point: QPoint, width: u32, height: u32) -> [f32; 2] {
     [uv[0] * width as f32, (1.0 - uv[1]) * height as f32]
 }
 
+fn compact_payload_from_buffers(
+    group_line_offsets: Vec<usize>,
+    line_points: Vec<f32>,
+    group_internal_widths: Vec<f32>,
+    group_outline_widths: Vec<f32>,
+    group_internal_colors: Vec<u8>,
+    group_outline_colors: Vec<u8>,
+    group_draw_outline: Vec<bool>,
+    group_draw_internal: Vec<bool>,
+    polygon_offsets: Vec<usize>,
+    polygon_points: Vec<f32>,
+    warning_enabled: bool,
+    padding_pixels: f32,
+    warning_width: f32,
+    warning_color: Vec<u8>,
+) -> Result<CompactPayload, BoxError> {
+    let group_count = group_internal_widths.len();
+    if group_line_offsets.len() != group_count + 1
+        || group_outline_widths.len() != group_count
+        || group_draw_outline.len() != group_count
+        || group_draw_internal.len() != group_count
+        || group_internal_colors.len() != group_count * 4
+        || group_outline_colors.len() != group_count * 4
+    {
+        return Err("Invalid group buffer lengths".into());
+    }
+    if line_points.len() % 4 != 0 {
+        return Err("line_points length must be divisible by 4".into());
+    }
+    if polygon_offsets.is_empty() || polygon_offsets[0] != 0 || polygon_points.len() % 2 != 0 {
+        return Err("Invalid polygon buffers".into());
+    }
+    if warning_color.len() != 4 {
+        return Err("warning_color must have 4 items".into());
+    }
+
+    let mut styles = Vec::with_capacity(group_count);
+    let mut point_positions = HashMap::new();
+    let mut original_segments = Vec::<CanonicalSegment>::new();
+    let mut original_segment_set = HashSet::<CanonicalSegment>::new();
+    let mut group_segments = Vec::with_capacity(group_count);
+
+    for group_index in 0..group_count {
+        styles.push(DrawStyle {
+            internal_width: group_internal_widths[group_index].max(0.0),
+            outline_width: group_outline_widths[group_index].max(0.0),
+            internal_color: [
+                group_internal_colors[group_index * 4],
+                group_internal_colors[group_index * 4 + 1],
+                group_internal_colors[group_index * 4 + 2],
+                group_internal_colors[group_index * 4 + 3],
+            ],
+            outline_color: [
+                group_outline_colors[group_index * 4],
+                group_outline_colors[group_index * 4 + 1],
+                group_outline_colors[group_index * 4 + 2],
+                group_outline_colors[group_index * 4 + 3],
+            ],
+            draw_outline: group_draw_outline[group_index],
+            draw_internal: group_draw_internal[group_index],
+        });
+
+        let start = group_line_offsets[group_index];
+        let end = group_line_offsets[group_index + 1];
+        let mut group_seen = HashSet::new();
+        let mut segments = Vec::new();
+        for line_index in start..end {
+            let base = line_index * 4;
+            let uv1 = [line_points[base], line_points[base + 1]];
+            let uv2 = [line_points[base + 2], line_points[base + 3]];
+            let q1 = quantize_point(uv1);
+            let q2 = quantize_point(uv2);
+            point_positions.entry(q1).or_insert(uv1);
+            point_positions.entry(q2).or_insert(uv2);
+            let Some(canonical) = canonical_segment(q1, q2) else {
+                continue;
+            };
+            if original_segment_set.insert(canonical) {
+                original_segments.push(canonical);
+            }
+            if group_seen.insert(canonical) {
+                segments.push(canonical);
+            }
+        }
+        segments.sort_by_key(|segment| (segment.start, segment.end));
+        group_segments.push(segments);
+    }
+    original_segments.sort_by_key(|segment| (segment.start, segment.end));
+
+    let polygon_count = polygon_offsets.len() - 1;
+    let mut polygons = Vec::with_capacity(polygon_count);
+    for polygon_index in 0..polygon_count {
+        let start = polygon_offsets[polygon_index];
+        let end = polygon_offsets[polygon_index + 1];
+        let mut points = Vec::with_capacity(end.saturating_sub(start));
+        for point_index in start..end {
+            let base = point_index * 2;
+            points.push([polygon_points[base], polygon_points[base + 1]]);
+        }
+        polygons.push(Polygon { points });
+    }
+
+    let padding_warning = if warning_enabled {
+        Some(PaddingWarningConfig {
+            enabled: true,
+            padding_pixels,
+            warning_width,
+            warning_color: [
+                warning_color[0],
+                warning_color[1],
+                warning_color[2],
+                warning_color[3],
+            ],
+        })
+    } else {
+        None
+    };
+
+    Ok(CompactPayload {
+        styles,
+        arrangement_input_segments: original_segments,
+        arrangement_input_group_segments: group_segments,
+        point_positions,
+        polygons,
+        padding_warning,
+    })
+}
+
 #[pyfunction(name = "draw_edges")]
 fn draw_edges_py(image_path: &str, width: u32, height: u32, edges_json: &str) -> PyResult<()> {
     draw_to_path(Path::new(image_path), width, height, edges_json)
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
+#[pyfunction(name = "draw_edges_buffered")]
+fn draw_edges_buffered_py(
+    image_path: &str,
+    width: u32,
+    height: u32,
+    group_line_offsets: Vec<usize>,
+    line_points: Vec<f32>,
+    group_internal_widths: Vec<f32>,
+    group_outline_widths: Vec<f32>,
+    group_internal_colors: Vec<u8>,
+    group_outline_colors: Vec<u8>,
+    group_draw_outline: Vec<bool>,
+    group_draw_internal: Vec<bool>,
+    polygon_offsets: Vec<usize>,
+    polygon_points: Vec<f32>,
+    warning_enabled: bool,
+    padding_pixels: f32,
+    warning_width: f32,
+    warning_color: Vec<u8>,
+) -> PyResult<()> {
+    let payload = compact_payload_from_buffers(
+        group_line_offsets,
+        line_points,
+        group_internal_widths,
+        group_outline_widths,
+        group_internal_colors,
+        group_outline_colors,
+        group_draw_outline,
+        group_draw_internal,
+        polygon_offsets,
+        polygon_points,
+        warning_enabled,
+        padding_pixels,
+        warning_width,
+        warning_color,
+    )
+    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let prepare_started_at = Instant::now();
+    let prepared = prepare_drawing_from_compact(&payload, width, height);
+    log_profile("prepare_total", prepare_started_at);
+
+    if Path::new(image_path).extension().and_then(|s| s.to_str()) == Some("svg") {
+        let render_started_at = Instant::now();
+        let document = draw_edges_svg(&prepared, width, height);
+        log_profile("render_svg", render_started_at);
+        save_svg(&document, Path::new(image_path))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    } else {
+        let render_started_at = Instant::now();
+        let pixmap = draw_edges_raster(&prepared, width, height)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        log_profile("render_raster", render_started_at);
+        save_image(&pixmap, Path::new(image_path))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+}
+
 #[pymodule(name = "_edge_drawer")]
 fn _edge_drawer(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(draw_edges_py, module)?)?;
+    module.add_function(wrap_pyfunction!(draw_edges_buffered_py, module)?)?;
     Ok(())
 }
 
@@ -1997,8 +2579,14 @@ mod tests {
     #[test]
     fn test_point_in_polygons_treats_overlaps_as_union() {
         let polygons = overlapping_polygons();
-        assert!(point_in_polygons([0.5, 0.5], &polygons));
-        assert!(!point_in_polygons([0.95, 0.95], &polygons));
+        let polygon_index = build_polygon_index(&polygons);
+        let mut sample_cache = HashMap::new();
+        assert!(point_in_polygons([0.5, 0.5], &polygon_index, &mut sample_cache));
+        assert!(!point_in_polygons([0.95, 0.95], &polygon_index, &mut sample_cache));
+        assert_eq!(
+            point_in_polygons_bruteforce([0.5, 0.5], &polygons),
+            point_in_polygons([0.5, 0.5], &polygon_index, &mut sample_cache)
+        );
     }
 
     #[test]

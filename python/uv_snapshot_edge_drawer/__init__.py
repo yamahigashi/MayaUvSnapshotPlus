@@ -86,6 +86,8 @@ class EdgeLineDrawerConfig:
 PROFILE_ENABLED = os.environ.get("MAYA_UV_SNAPSHOT_PROFILE") == "1"
 _MESH_TOPOLOGY_CACHE = {}
 _MESH_DIRTY_CALLBACKS = {}
+DEFAULT_PADDING_WARNING_COLOR = [255, 64, 64, 255]
+DEFAULT_PADDING_WARNING_WIDTH = 4.0
 
 
 def _profile_log(label, started_at):
@@ -237,6 +239,104 @@ class UVPolygon(object):
         self.points = [list(point) for point in points]
 
 
+class DrawerPayloadBuffers(object):
+    """Flat payload buffers for the native drawer."""
+
+    def __init__(
+        self,
+        group_line_offsets,
+        line_points,
+        group_internal_widths,
+        group_outline_widths,
+        group_internal_colors,
+        group_outline_colors,
+        group_draw_outline,
+        group_draw_internal,
+        polygon_offsets,
+        polygon_points,
+        padding_warning,
+        json_fallback,
+    ):
+        # type: (List[int], List[float], List[float], List[float], List[int], List[int], List[bool], List[bool], List[int], List[float], Optional[Dict[Text, Any]], Dict[Text, Any]) -> None
+        self.group_line_offsets = group_line_offsets
+        self.line_points = line_points
+        self.group_internal_widths = group_internal_widths
+        self.group_outline_widths = group_outline_widths
+        self.group_internal_colors = group_internal_colors
+        self.group_outline_colors = group_outline_colors
+        self.group_draw_outline = group_draw_outline
+        self.group_draw_internal = group_draw_internal
+        self.polygon_offsets = polygon_offsets
+        self.polygon_points = polygon_points
+        self.padding_warning = padding_warning
+        self._json_fallback = json_fallback
+        self._json_string = None
+
+    def as_json_string(self):
+        # type: () -> Text
+        if self._json_string is None:
+            self._json_string = edges_to_json_string(self._json_fallback)
+        return self._json_string
+
+
+def _canonical_line_key(line):
+    # type: (EdgeLine) -> Tuple[Tuple[float, float], Tuple[float, float]]
+    start = (float(line.uv1[0]), float(line.uv1[1]))
+    end = (float(line.uv2[0]), float(line.uv2[1]))
+    if start <= end:
+        return start, end
+    return end, start
+
+
+def _draw_style_key(group):
+    # type: (EdgeLineDrawInfo) -> Tuple[float, float, Tuple[int, int, int, int], Tuple[int, int, int, int], bool, bool]
+    return (
+        float(group.internal_width),
+        float(group.outline_width),
+        tuple(int(value) for value in group.internal_color),
+        tuple(int(value) for value in group.outline_color),
+        bool(group.draw_outline),
+        bool(group.draw_internal),
+    )
+
+
+def _merge_payload_edge_groups(groups):
+    # type: (List[EdgeLineDrawInfo]) -> List[EdgeLineDrawInfo]
+    merged_groups = []
+    merged_by_style = {}
+
+    for group in groups:
+        style_key = _draw_style_key(group)
+        merged = merged_by_style.get(style_key)
+        if merged is None:
+            merged = EdgeLineDrawInfo(
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                group.internal_width,
+                group.outline_width,
+                [],
+                draw_outline=group.draw_outline,
+                draw_internal=group.draw_internal,
+            )
+            merged.internal_color = list(group.internal_color)
+            merged.outline_color = list(group.outline_color)
+            merged._seen_lines = set()
+            merged_by_style[style_key] = merged
+            merged_groups.append(merged)
+
+        for line in group.lines:
+            key = _canonical_line_key(line)
+            if key in merged._seen_lines:
+                continue
+            merged._seen_lines.add(key)
+            merged.lines.append(line)
+
+    for group in merged_groups:
+        del group._seen_lines
+
+    return merged_groups
+
+
 def _should_draw_edge_type(config, key):
     # type: (EdgeLineDrawerConfig, Text) -> bool
     setting = config.get_setting(key)
@@ -304,6 +404,69 @@ def edges_to_json_string(edges):
     res = json.dumps(edges, cls=EdgeEncoder)
 
     return res
+
+
+def build_drawer_payload_buffers(payload):
+    # type: (Dict[Text, Any]) -> DrawerPayloadBuffers
+    merged_groups = _merge_payload_edge_groups(payload["edges"])
+    group_line_offsets = [0]
+    line_points = []
+    group_internal_widths = []
+    group_outline_widths = []
+    group_internal_colors = []
+    group_outline_colors = []
+    group_draw_outline = []
+    group_draw_internal = []
+
+    line_count = 0
+    for group in merged_groups:
+        group_internal_widths.append(float(group.internal_width))
+        group_outline_widths.append(float(group.outline_width))
+        group_internal_colors.extend(int(value) for value in group.internal_color)
+        group_outline_colors.extend(int(value) for value in group.outline_color)
+        group_draw_outline.append(bool(group.draw_outline))
+        group_draw_internal.append(bool(group.draw_internal))
+        for line in group.lines:
+            line_points.extend(
+                [
+                    float(line.uv1[0]),
+                    float(line.uv1[1]),
+                    float(line.uv2[0]),
+                    float(line.uv2[1]),
+                ]
+            )
+            line_count += 1
+        group_line_offsets.append(line_count)
+
+    polygon_offsets = [0]
+    polygon_points = []
+    polygon_point_count = 0
+    for polygon in payload["polygons"]:
+        for point in polygon.points:
+            polygon_points.extend([float(point[0]), float(point[1])])
+            polygon_point_count += 1
+        polygon_offsets.append(polygon_point_count)
+
+    padding_warning = payload.get("padding_warning")
+    optimized_payload = {
+        "edges": merged_groups,
+        "polygons": payload["polygons"],
+        "padding_warning": padding_warning,
+    }
+    return DrawerPayloadBuffers(
+        group_line_offsets=group_line_offsets,
+        line_points=line_points,
+        group_internal_widths=group_internal_widths,
+        group_outline_widths=group_outline_widths,
+        group_internal_colors=group_internal_colors,
+        group_outline_colors=group_outline_colors,
+        group_draw_outline=group_draw_outline,
+        group_draw_internal=group_draw_internal,
+        polygon_offsets=polygon_offsets,
+        polygon_points=polygon_points,
+        padding_warning=padding_warning,
+        json_fallback=optimized_payload,
+    )
 
 
 ##############################################################################
@@ -589,8 +752,8 @@ def get_uv_face_polygons(meshlike, umin=0.0, umax=1.0, vmin=0.0, vmax=1.0):
     return get_mesh_topology_snapshot(meshlike).get_polygons(umin, umax, vmin, vmax)
 
 
-def execute_drawer(image_path, width, height, json_data, open_after_save=True):
-    # type: (Text, int, int, Text, bool) -> None
+def execute_drawer(image_path, width, height, payload_data, open_after_save=True):
+    # type: (Text, int, int, Any, bool) -> None
     """Execute the native drawer when available, otherwise fallback to edge_drawer.exe"""
 
     image_path = _normalize_output_path(image_path)
@@ -598,12 +761,36 @@ def execute_drawer(image_path, width, height, json_data, open_after_save=True):
     if sys.version_info > (3, 0):
         try:
             from uv_snapshot_edge_drawer import _edge_drawer
-            _edge_drawer.draw_edges(image_path, width, height, json_data)
+            if isinstance(payload_data, DrawerPayloadBuffers) and hasattr(_edge_drawer, "draw_edges_buffered"):
+                warning = payload_data.padding_warning or {}
+                warning_color = warning.get("warning_color", DEFAULT_PADDING_WARNING_COLOR)
+                _edge_drawer.draw_edges_buffered(
+                    image_path,
+                    width,
+                    height,
+                    payload_data.group_line_offsets,
+                    payload_data.line_points,
+                    payload_data.group_internal_widths,
+                    payload_data.group_outline_widths,
+                    payload_data.group_internal_colors,
+                    payload_data.group_outline_colors,
+                    payload_data.group_draw_outline,
+                    payload_data.group_draw_internal,
+                    payload_data.polygon_offsets,
+                    payload_data.polygon_points,
+                    bool(warning.get("enabled", False)),
+                    float(warning.get("padding_pixels", 8.0)),
+                    float(warning.get("warning_width", DEFAULT_PADDING_WARNING_WIDTH)),
+                    [int(value) for value in warning_color],
+                )
+            else:
+                json_data = payload_data.as_json_string() if isinstance(payload_data, DrawerPayloadBuffers) else payload_data
+                _edge_drawer.draw_edges(image_path, width, height, json_data)
         except Exception as exc:
-            _execute_drawer_cli(image_path, width, height, json_data, native_error=exc)
+            _execute_drawer_cli(image_path, width, height, payload_data, native_error=exc)
             return
     else:
-        _execute_drawer_cli(image_path, width, height, json_data)
+        _execute_drawer_cli(image_path, width, height, payload_data)
 
     if open_after_save:
         subprocess.call("start " + image_path, shell=True)
@@ -619,12 +806,13 @@ def _normalize_output_path(image_path):
     return image_path + ".png"
 
 
-def _execute_drawer_cli(image_path, width, height, json_data, native_error=None):
-    # type: (Text, int, int, Text, Optional[Exception]) -> None
+def _execute_drawer_cli(image_path, width, height, payload_data, native_error=None):
+    # type: (Text, int, int, Any, Optional[Exception]) -> None
     """Execute the CLI fallback."""
 
     temp_path = None
     try:
+        json_data = payload_data.as_json_string() if isinstance(payload_data, DrawerPayloadBuffers) else payload_data
         # Avoid Windows command line length limits in the fallback path.
         if len(json_data) > 7500:
             with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
