@@ -257,7 +257,7 @@ class MeshTopologyBuildSession(object):
             return
 
         self.uv_set_name = self.fn_mesh.currentUVSetName()
-        self.current_uv_set_id = get_current_uv_set_id(self.fn_mesh)
+        self.current_uv_set_id = get_current_uv_set_id(self.fn_mesh) if self.include_edges else None
         self.hard_edges_uvs = []
         self.soft_edges_uvs = []
         self.border_edges = []
@@ -284,7 +284,8 @@ class MeshTopologyBuildSession(object):
         self.it_vert = om.MItMeshVertex(self.fn_mesh.object()) if self.include_edges else None
         self.it_edge = om.MItMeshEdge(self.fn_mesh.object()) if self.include_edges else None
         self.it_face_normals = om.MItMeshPolygon(self.fn_mesh.object()) if self.include_edges else None
-        self.it_face_polygons = om.MItMeshPolygon(self.fn_mesh.object()) if self.include_polygons else None
+        self.it_face_polygons = None
+        self._use_polygon_iterator_fallback = False
 
         if self.include_edges:
             try:
@@ -387,17 +388,21 @@ class MeshTopologyBuildSession(object):
 
             if self.phase == "faces":
                 phase_started = time.perf_counter()
-                if self.it_face_polygons.isDone():
+                if self._use_polygon_iterator_fallback and self.it_face_polygons is None:
+                    self.it_face_polygons = om.MItMeshPolygon(self.fn_mesh.object())
+                if self.it_face_polygons is not None and self.it_face_polygons.isDone():
                     self.phase_timings["faces"] += time.perf_counter() - phase_started
                     self.phase = "finalize"
                     continue
                 try:
-                    self.polygon_offsets, self.polygon_points = build_polygon_buffers_from_mesh(
-                        self.fn_mesh,
-                        self.uv_set_name,
-                    )
+                    if self._use_polygon_iterator_fallback:
+                        raise RuntimeError
+                    self.polygon_offsets, self.polygon_points = build_polygon_buffers_from_mesh(self.fn_mesh, self.uv_set_name)
                     self.phase = "finalize"
                 except RuntimeError:
+                    self._use_polygon_iterator_fallback = True
+                    if self.it_face_polygons is None:
+                        self.it_face_polygons = om.MItMeshPolygon(self.fn_mesh.object())
                     us, vs = self.it_face_polygons.getUVs(self.uv_set_name)
                     append_deduped_uv_polygon(us, vs, self.polygon_offsets, self.polygon_points)
                     self.it_face_polygons.next()
@@ -780,6 +785,66 @@ def build_polygon_buffers_from_mesh(fn_mesh, uv_set_name):
     return polygon_offsets, polygon_points
 
 
+def _build_polygon_buffers_with_iterator(fn_mesh, uv_set_name):
+    # type: (om.MFnMesh, Text) -> Tuple[List[int], List[float]]
+    polygon_offsets = [0]
+    polygon_points = []
+    it_face_polygons = om.MItMeshPolygon(fn_mesh.object())
+    while not it_face_polygons.isDone():
+        us, vs = it_face_polygons.getUVs(uv_set_name)
+        append_deduped_uv_polygon(us, vs, polygon_offsets, polygon_points)
+        it_face_polygons.next()
+    return polygon_offsets, polygon_points
+
+
+def _build_polygon_only_snapshot(fn_mesh):
+    # type: (om.MFnMesh) -> MeshTopologySnapshot
+    cache_key = _get_mesh_cache_key(fn_mesh, include_edges=False, include_polygons=True)
+    cached = _MESH_TOPOLOGY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    mesh_name = fn_mesh.fullPathName()
+    uv_set_name = fn_mesh.currentUVSetName()
+    faces_started = time.perf_counter()
+    try:
+        polygon_offsets, polygon_points = build_polygon_buffers_from_mesh(fn_mesh, uv_set_name)
+    except RuntimeError:
+        polygon_offsets, polygon_points = _build_polygon_buffers_with_iterator(fn_mesh, uv_set_name)
+    faces_elapsed = time.perf_counter() - faces_started
+
+    finalize_started = time.perf_counter()
+    snapshot = MeshTopologySnapshot(
+        mesh_name,
+        uv_set_name,
+        {
+            "hard": [],
+            "soft": [],
+            "border": [],
+            "boundary": [],
+            "crease": [],
+            "fold": [],
+        },
+        [],
+        polygon_offsets=polygon_offsets,
+        polygon_points=polygon_points,
+        build_profile={
+            "crease": 0.0,
+            "border": 0.0,
+            "edges": 0.0,
+            "faces": faces_elapsed,
+            "finalize": 0.0,
+        },
+        has_edge_data=False,
+        has_polygon_data=True,
+    )
+    finalize_elapsed = time.perf_counter() - finalize_started
+    snapshot.build_profile["finalize"] = finalize_elapsed
+    _MESH_TOPOLOGY_CACHE[cache_key] = snapshot
+    _register_mesh_dirty_callback(fn_mesh)
+    return snapshot
+
+
 def _polygon_offsets_from_polygons(polygons):
     # type: (List[UVPolygon]) -> List[int]
     polygon_offsets = [0]
@@ -1102,6 +1167,8 @@ def start_mesh_topology_build_session(meshlike, include_edges=True, include_poly
 def get_mesh_topology_snapshot(meshlike, include_edges=True, include_polygons=True):
     # type: (MeshLike, bool, bool) -> MeshTopologySnapshot
     fn_mesh = get_mfnmesh_from_meshlike(meshlike)
+    if include_polygons and not include_edges:
+        return _build_polygon_only_snapshot(fn_mesh)
     cache_key = _get_mesh_cache_key(
         fn_mesh,
         include_edges=include_edges,
