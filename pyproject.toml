@@ -1,3 +1,7 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
 [tool.flake8]
 max-line-length = 120
 max-complexity = 11
@@ -123,3 +127,9 @@ skip-magic-trailing-comma = false
 
 # Like Black, automatically detect the appropriate line ending.
 line-ending = "auto"
+
+[tool.maturin]
+python-source = "python"
+manifest-path = "rust/edge_drawer/Cargo.toml"
+module-name = "uv_snapshot_edge_drawer._edge_drawer"
+bindings = "pyo3"
