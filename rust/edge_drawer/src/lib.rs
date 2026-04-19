@@ -2372,6 +2372,7 @@ fn build_polygon_buffers_from_indexed_uvs(
     let mut polygon_points = Vec::with_capacity(face_uv_ids.len() * 2);
     polygon_offsets.push(0);
 
+    let uv_len = all_us.len();
     let mut uv_index = 0usize;
     for &face_uv_count in face_uv_counts {
         if face_uv_count == 0 {
@@ -2385,27 +2386,38 @@ fn build_polygon_buffers_from_indexed_uvs(
 
         let start_len = polygon_points.len();
         let mut deduped_point_count = 0usize;
-        let mut previous = None::<(f32, f32)>;
-        let mut first = None::<(f32, f32)>;
+        let mut first_u = 0.0f32;
+        let mut first_v = 0.0f32;
+        let mut previous_u = 0.0f32;
+        let mut previous_v = 0.0f32;
+        let mut has_previous = false;
+        let mut face_uv_index = uv_index;
 
-        for &uv_id in &face_uv_ids[uv_index..next_uv_index] {
-            let Some((&u, &v)) = all_us.get(uv_id).zip(all_vs.get(uv_id)) else {
+        while face_uv_index < next_uv_index {
+            let uv_id = face_uv_ids[face_uv_index];
+            if uv_id >= uv_len {
                 return Err("face_uv_ids contain an out-of-range UV index".into());
-            };
+            }
+            let u = all_us[uv_id];
+            let v = all_vs[uv_id];
+            face_uv_index += 1;
 
-            if previous == Some((u, v)) {
+            if has_previous && previous_u == u && previous_v == v {
                 continue;
             }
             if deduped_point_count == 0 {
-                first = Some((u, v));
+                first_u = u;
+                first_v = v;
             }
             polygon_points.push(u);
             polygon_points.push(v);
-            previous = Some((u, v));
+            previous_u = u;
+            previous_v = v;
+            has_previous = true;
             deduped_point_count += 1;
         }
 
-        if deduped_point_count >= 3 && previous == first {
+        if deduped_point_count >= 3 && previous_u == first_u && previous_v == first_v {
             polygon_points.truncate(polygon_points.len() - 2);
             deduped_point_count -= 1;
         }
