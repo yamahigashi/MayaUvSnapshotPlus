@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -141,7 +142,7 @@ struct FaceLoop {
 #[derive(Clone, Debug)]
 struct SegmentArrangement {
     segments: Vec<CanonicalSegment>,
-    point_positions: HashMap<QPoint, [f32; 2]>,
+    point_positions: PointPositionIndex,
     group_segments: Vec<Vec<CanonicalSegment>>,
 }
 
@@ -150,9 +151,15 @@ struct CompactPayload {
     styles: Vec<DrawStyle>,
     arrangement_input_segments: Vec<CanonicalSegment>,
     arrangement_input_group_segments: Vec<Vec<CanonicalSegment>>,
-    point_positions: HashMap<QPoint, [f32; 2]>,
+    point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     polygons: Vec<Polygon>,
     padding_warning: Option<PaddingWarningConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct PointPositionIndex {
+    base: Arc<HashMap<QPoint, [f32; 2]>>,
+    extra: HashMap<QPoint, [f32; 2]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,9 +170,6 @@ struct SegmentBounds {
 
 #[derive(Clone, Debug)]
 struct UniformGridIndex {
-    min: [f32; 2],
-    cell_size: [f32; 2],
-    resolution: u32,
     cells: HashMap<(i32, i32), Vec<usize>>,
 }
 
@@ -176,9 +180,18 @@ struct IndexedPolygon {
 }
 
 #[derive(Clone, Debug)]
+struct DenseGridIndex {
+    min: [f32; 2],
+    cell_size: [f32; 2],
+    resolution: u32,
+    cell_starts: Vec<usize>,
+    indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct PolygonIndex {
     polygons: Vec<IndexedPolygon>,
-    grid: UniformGridIndex,
+    grid: DenseGridIndex,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -427,7 +440,7 @@ fn prepare_drawing_from_compact(
     let arrangement_started_at = Instant::now();
     let arrangement = build_segment_arrangement_from_parts(
         payload.arrangement_input_segments.clone(),
-        payload.point_positions.clone(),
+        Arc::clone(&payload.point_positions),
         &payload.arrangement_input_group_segments,
     );
     log_profile("arrangement", arrangement_started_at);
@@ -493,8 +506,28 @@ fn collect_point_positions(edges: &[Edges]) -> HashMap<QPoint, [f32; 2]> {
     positions
 }
 
+fn point_position(point_positions: &PointPositionIndex, point: QPoint) -> [f32; 2] {
+    point_positions
+        .base
+        .get(&point)
+        .copied()
+        .or_else(|| point_positions.extra.get(&point).copied())
+        .expect("point position must exist")
+}
+
+fn insert_point_position(
+    point_positions: &mut PointPositionIndex,
+    point: QPoint,
+    uv: [f32; 2],
+) {
+    if point_positions.base.contains_key(&point) || point_positions.extra.contains_key(&point) {
+        return;
+    }
+    point_positions.extra.insert(point, uv);
+}
+
 fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
-    let point_positions = collect_point_positions(edges);
+    let point_positions = Arc::new(collect_point_positions(edges));
     let original_segments = collect_unique_segments(edges);
     let mut group_segments = Vec::with_capacity(edges.len());
     for group in edges {
@@ -516,39 +549,74 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
 
 fn build_segment_arrangement_from_parts(
     original_segments: Vec<CanonicalSegment>,
-    mut point_positions: HashMap<QPoint, [f32; 2]>,
+    base_point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     original_group_segments: &[Vec<CanonicalSegment>],
 ) -> SegmentArrangement {
-    let mut split_points: HashMap<CanonicalSegment, Vec<QPoint>> = HashMap::new();
+    let mut point_positions = PointPositionIndex {
+        base: base_point_positions,
+        extra: HashMap::new(),
+    };
+    let segment_uvs = original_segments
+        .iter()
+        .map(|segment| {
+            (
+                point_position(&point_positions, segment.start),
+                point_position(&point_positions, segment.end),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut split_points = vec![Vec::<QPoint>::new(); original_segments.len()];
     let segment_bounds = original_segments
         .iter()
-        .map(|segment| segment_bounds_uv(*segment, &point_positions))
+        .zip(segment_uvs.iter())
+        .map(|(_, (start, end))| SegmentBounds {
+            min: [start[0].min(end[0]), start[1].min(end[1])],
+            max: [start[0].max(end[0]), start[1].max(end[1])],
+        })
         .collect::<Vec<_>>();
 
-    for (left_index, right_index) in collect_candidate_pairs(&segment_bounds, 0.0) {
+    visit_candidate_pairs(&segment_bounds, 0.0, |left_index, right_index| {
         let left = original_segments[left_index];
         let right = original_segments[right_index];
-        let left_start = point_positions[&left.start];
-        let left_end = point_positions[&left.end];
-        let right_start = point_positions[&right.start];
-        let right_end = point_positions[&right.end];
+        let (left_start, left_end) = segment_uvs[left_index];
+        let (right_start, right_end) = segment_uvs[right_index];
 
-        for point in split_intersection_points(left_start, left_end, right_start, right_end) {
-            let quantized = quantize_point(point);
-            point_positions.entry(quantized).or_insert(point);
-            append_split_point(&mut split_points, left, quantized);
-            append_split_point(&mut split_points, right, quantized);
-        }
+        register_pair_splits(
+            left,
+            right,
+            left_index,
+            right_index,
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+            &mut point_positions,
+            split_points.as_mut_slice(),
+        );
+    });
+
+    if split_points.iter().all(|points| points.is_empty()) {
+        return SegmentArrangement {
+            segments: original_segments.clone(),
+            point_positions,
+            group_segments: original_group_segments.to_vec(),
+        };
     }
 
     let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> = HashMap::new();
-    let mut segments_set = HashSet::new();
-    for segment in &original_segments {
-        let parts = split_segment(*segment, split_points.get(segment), &point_positions);
+    let mut segments_set = original_segments.iter().copied().collect::<HashSet<_>>();
+    for (segment_index, points) in split_points.iter().enumerate() {
+        if points.is_empty() {
+            continue;
+        }
+
+        let segment = original_segments[segment_index];
+        let parts = split_segment(segment, Some(points.as_slice()), &point_positions);
+        segments_set.remove(&segment);
         for part in &parts {
             segments_set.insert(*part);
         }
-        split_segments_by_original.insert(*segment, parts);
+        split_segments_by_original.insert(segment, parts);
     }
 
     let mut segments = segments_set.into_iter().collect::<Vec<_>>();
@@ -556,10 +624,20 @@ fn build_segment_arrangement_from_parts(
 
     let mut group_segments = Vec::with_capacity(original_group_segments.len());
     for original_group in original_group_segments {
+        if !original_group
+            .iter()
+            .any(|original| split_segments_by_original.contains_key(original))
+        {
+            group_segments.push(original_group.clone());
+            continue;
+        }
+
         let mut group_set = HashSet::new();
         for original in original_group {
             if let Some(parts) = split_segments_by_original.get(original) {
                 group_set.extend(parts.iter().copied());
+            } else {
+                group_set.insert(*original);
             }
         }
         let mut parts = group_set.into_iter().collect::<Vec<_>>();
@@ -574,58 +652,148 @@ fn build_segment_arrangement_from_parts(
     }
 }
 
-fn append_split_point(
-    split_points: &mut HashMap<CanonicalSegment, Vec<QPoint>>,
+fn append_split_point_if_interior(
+    split_points: &mut Vec<QPoint>,
     segment: CanonicalSegment,
     point: QPoint,
+) -> bool {
+    if is_segment_endpoint(segment, point) {
+        return false;
+    }
+
+    if !split_points.contains(&point) {
+        split_points.push(point);
+        return true;
+    }
+    false
+}
+
+fn register_pair_splits(
+    left: CanonicalSegment,
+    right: CanonicalSegment,
+    left_index: usize,
+    right_index: usize,
+    left_start: [f32; 2],
+    left_end: [f32; 2],
+    right_start: [f32; 2],
+    right_end: [f32; 2],
+    point_positions: &mut PointPositionIndex,
+    split_points: &mut [Vec<QPoint>],
 ) {
-    let points = split_points.entry(segment).or_default();
-    if !points.contains(&point) {
-        points.push(point);
+    if segments_share_endpoint(left, right)
+        && !colinear_segments(left_start, left_end, right_start, right_end)
+    {
+        return;
+    }
+
+    if colinear_segments(left_start, left_end, right_start, right_end) {
+        register_colinear_overlap_splits(
+            left,
+            right,
+            left_index,
+            right_index,
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+            point_positions,
+            split_points,
+        );
+        return;
+    }
+
+    let Some(point) = segment_intersection_point(left_start, left_end, right_start, right_end) else {
+        return;
+    };
+    register_split_point_for_segment(&mut split_points[left_index], point_positions, left, point);
+    register_split_point_for_segment(&mut split_points[right_index], point_positions, right, point);
+}
+
+fn register_colinear_overlap_splits(
+    left: CanonicalSegment,
+    right: CanonicalSegment,
+    left_index: usize,
+    right_index: usize,
+    left_start: [f32; 2],
+    left_end: [f32; 2],
+    right_start: [f32; 2],
+    right_end: [f32; 2],
+    point_positions: &mut PointPositionIndex,
+    split_points: &mut [Vec<QPoint>],
+) {
+    for point in [left_start, left_end] {
+        if point_on_segment(point, right_start, right_end) {
+            register_split_point_for_segment(&mut split_points[right_index], point_positions, right, point);
+        }
+    }
+    for point in [right_start, right_end] {
+        if point_on_segment(point, left_start, left_end) {
+            register_split_point_for_segment(&mut split_points[left_index], point_positions, left, point);
+        }
     }
 }
 
-fn split_intersection_points(
-    a0: [f32; 2],
-    a1: [f32; 2],
-    b0: [f32; 2],
-    b1: [f32; 2],
-) -> Vec<[f32; 2]> {
-    let mut points = Vec::new();
-    if colinear_segments(a0, a1, b0, b1) {
-        for point in [a0, a1, b0, b1] {
-            if point_on_segment(point, a0, a1) && point_on_segment(point, b0, b1) {
-                points.push(point);
-            }
-        }
-        dedupe_points(points)
-    } else if let Some(point) = segment_intersection_point(a0, a1, b0, b1) {
-        vec![point]
-    } else {
-        Vec::new()
+fn register_split_point_for_segment(
+    split_points: &mut Vec<QPoint>,
+    point_positions: &mut PointPositionIndex,
+    segment: CanonicalSegment,
+    point: [f32; 2],
+) {
+    let quantized = quantize_point(point);
+    if append_split_point_if_interior(split_points, segment, quantized) {
+        insert_point_position(point_positions, quantized, point);
     }
+}
+
+fn is_segment_endpoint(segment: CanonicalSegment, point: QPoint) -> bool {
+    point == segment.start || point == segment.end
+}
+
+fn segments_share_endpoint(left: CanonicalSegment, right: CanonicalSegment) -> bool {
+    left.start == right.start
+        || left.start == right.end
+        || left.end == right.start
+        || left.end == right.end
 }
 
 fn split_segment(
     original: CanonicalSegment,
-    split_points: Option<&Vec<QPoint>>,
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    split_points: Option<&[QPoint]>,
+    point_positions: &PointPositionIndex,
 ) -> Vec<CanonicalSegment> {
-    let start = point_positions[&original.start];
-    let end = point_positions[&original.end];
+    let start = point_position(point_positions, original.start);
+    let end = point_position(point_positions, original.end);
     let direction = [end[0] - start[0], end[1] - start[1]];
     let len_sq = direction[0] * direction[0] + direction[1] * direction[1];
     if len_sq <= AREA_EPSILON {
         return Vec::new();
     }
 
-    let mut ordered = vec![original.start, original.end];
-    if let Some(split_points) = split_points {
-        ordered.extend(split_points.iter().copied());
+    let Some(split_points) = split_points else {
+        return vec![original];
+    };
+    if split_points.is_empty() {
+        return vec![original];
     }
+    if split_points.len() == 1 {
+        let point = split_points[0];
+        let mut segments = Vec::with_capacity(2);
+        if let Some(segment) = canonical_segment(original.start, point) {
+            segments.push(segment);
+        }
+        if let Some(segment) = canonical_segment(point, original.end) {
+            segments.push(segment);
+        }
+        return segments;
+    }
+
+    let mut ordered = Vec::with_capacity(split_points.len() + 2);
+    ordered.push(original.start);
+    ordered.push(original.end);
+    ordered.extend(split_points.iter().copied());
     ordered.sort_by(|lhs, rhs| {
-        segment_parameter(point_positions[lhs], start, end)
-            .total_cmp(&segment_parameter(point_positions[rhs], start, end))
+        segment_parameter(point_position(point_positions, *lhs), start, end)
+            .total_cmp(&segment_parameter(point_position(point_positions, *rhs), start, end))
     });
     ordered.dedup();
 
@@ -646,18 +814,6 @@ fn segment_parameter(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
         return 0.0;
     }
     ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / len_sq
-}
-
-fn dedupe_points(points: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for point in points {
-        let quantized = quantize_point(point);
-        if seen.insert(quantized) {
-            result.push(point);
-        }
-    }
-    result
 }
 
 #[cfg(test)]
@@ -895,14 +1051,34 @@ fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2])
     (min, max)
 }
 
-fn build_uniform_grid(bounds: &[SegmentBounds], expand: f32) -> UniformGridIndex {
-    let resolution = default_grid_resolution(bounds.len());
+fn build_dense_grid(bounds: &[SegmentBounds], expand: f32, resolution: u32) -> DenseGridIndex {
     let (min, max) = combine_bounds(bounds, expand);
     let cell_size = [
         (max[0] - min[0]) / resolution as f32,
         (max[1] - min[1]) / resolution as f32,
     ];
-    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let cell_count = (resolution as usize) * (resolution as usize);
+    let mut counts = vec![0usize; cell_count];
+
+    for bounds in bounds.iter() {
+        let min_x = cell_coord(bounds.min[0] - expand, min[0], cell_size[0], resolution);
+        let max_x = cell_coord(bounds.max[0] + expand, min[0], cell_size[0], resolution);
+        let min_y = cell_coord(bounds.min[1] - expand, min[1], cell_size[1], resolution);
+        let max_y = cell_coord(bounds.max[1] + expand, min[1], cell_size[1], resolution);
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                counts[dense_cell_index(x, y, resolution)] += 1;
+            }
+        }
+    }
+
+    let mut cell_starts = vec![0usize; cell_count + 1];
+    for index in 0..cell_count {
+        cell_starts[index + 1] = cell_starts[index] + counts[index];
+    }
+    let mut indices = vec![0usize; cell_starts[cell_count]];
+    let mut write_offsets = cell_starts[..cell_count].to_vec();
 
     for (idx, bounds) in bounds.iter().enumerate() {
         let min_x = cell_coord(bounds.min[0] - expand, min[0], cell_size[0], resolution);
@@ -912,22 +1088,29 @@ fn build_uniform_grid(bounds: &[SegmentBounds], expand: f32) -> UniformGridIndex
 
         for x in min_x..=max_x {
             for y in min_y..=max_y {
-                cells.entry((x, y)).or_default().push(idx);
+                let cell_index = dense_cell_index(x, y, resolution);
+                let write_index = write_offsets[cell_index];
+                indices[write_index] = idx;
+                write_offsets[cell_index] += 1;
             }
         }
     }
 
-    UniformGridIndex {
+    DenseGridIndex {
         min,
         cell_size,
         resolution,
-        cells,
+        cell_starts,
+        indices,
     }
 }
 
-fn collect_candidate_pairs(bounds: &[SegmentBounds], expand: f32) -> Vec<(usize, usize)> {
+fn visit_candidate_pairs<F>(bounds: &[SegmentBounds], expand: f32, mut visitor: F)
+where
+    F: FnMut(usize, usize),
+{
     if bounds.len() < 2 {
-        return Vec::new();
+        return;
     }
 
     let mut sorted_indices = (0..bounds.len()).collect::<Vec<_>>();
@@ -938,26 +1121,22 @@ fn collect_candidate_pairs(bounds: &[SegmentBounds], expand: f32) -> Vec<(usize,
     });
 
     let mut active = Vec::<usize>::new();
-    let mut pairs = Vec::new();
     for &current in &sorted_indices {
         let current_min_x = bounds[current].min[0] - expand;
         active.retain(|idx| bounds[*idx].max[0] + expand >= current_min_x);
 
         for &candidate in &active {
             if bounds_overlap(bounds[current], bounds[candidate], expand) {
-                let pair = if candidate < current {
-                    (candidate, current)
+                if candidate < current {
+                    visitor(candidate, current);
                 } else {
-                    (current, candidate)
-                };
-                pairs.push(pair);
+                    visitor(current, candidate);
+                }
             }
         }
 
         active.push(current);
     }
-
-    pairs
 }
 
 fn bounds_overlap(left: SegmentBounds, right: SegmentBounds, expand: f32) -> bool {
@@ -977,16 +1156,8 @@ fn cell_coord(value: f32, min: f32, cell_size: f32, resolution: u32) -> i32 {
     scaled.clamp(0, resolution as i32 - 1)
 }
 
-fn segment_bounds_uv(
-    segment: CanonicalSegment,
-    point_positions: &HashMap<QPoint, [f32; 2]>,
-) -> SegmentBounds {
-    let start = point_positions[&segment.start];
-    let end = point_positions[&segment.end];
-    SegmentBounds {
-        min: [start[0].min(end[0]), start[1].min(end[1])],
-        max: [start[0].max(end[0]), start[1].max(end[1])],
-    }
+fn dense_cell_index(x: i32, y: i32, resolution: u32) -> usize {
+    (y as usize) * (resolution as usize) + (x as usize)
 }
 
 fn segment_bounds_canvas(segment: CanonicalSegment, width: u32, height: u32) -> SegmentBounds {
@@ -1007,7 +1178,6 @@ fn build_canvas_grid(
     let resolution = default_grid_resolution(segments.len());
     let width_f = width.max(1) as f32;
     let height_f = height.max(1) as f32;
-    let min = [0.0, 0.0];
     let cell_size = [
         width_f / resolution as f32,
         height_f / resolution as f32,
@@ -1016,10 +1186,14 @@ fn build_canvas_grid(
 
     for (idx, segment) in segments.iter().enumerate() {
         let bounds = segment_bounds_canvas(*segment, width, height);
-        let min_x = cell_coord((bounds.min[0] - expand_pixels).max(0.0), 0.0, cell_size[0], resolution);
-        let max_x = cell_coord((bounds.max[0] + expand_pixels).min(width_f), 0.0, cell_size[0], resolution);
-        let min_y = cell_coord((bounds.min[1] - expand_pixels).max(0.0), 0.0, cell_size[1], resolution);
-        let max_y = cell_coord((bounds.max[1] + expand_pixels).min(height_f), 0.0, cell_size[1], resolution);
+        let min_x =
+            cell_coord((bounds.min[0] - expand_pixels).max(0.0), 0.0, cell_size[0], resolution);
+        let max_x =
+            cell_coord((bounds.max[0] + expand_pixels).min(width_f), 0.0, cell_size[0], resolution);
+        let min_y =
+            cell_coord((bounds.min[1] - expand_pixels).max(0.0), 0.0, cell_size[1], resolution);
+        let max_y =
+            cell_coord((bounds.max[1] + expand_pixels).min(height_f), 0.0, cell_size[1], resolution);
 
         for x in min_x..=max_x {
             for y in min_y..=max_y {
@@ -1029,16 +1203,13 @@ fn build_canvas_grid(
     }
 
     UniformGridIndex {
-        min,
-        cell_size,
-        resolution,
         cells,
     }
 }
 
 fn detect_padding_warning_segments(
     outline_segments: &HashSet<CanonicalSegment>,
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
     width: u32,
     height: u32,
     padding_warning: Option<&PaddingWarningConfig>,
@@ -1243,7 +1414,7 @@ fn segment_intersection_point(
 
 fn classify_segments(
     unique_segments: &[CanonicalSegment],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
     polygons: &[Polygon],
 ) -> (HashSet<CanonicalSegment>, HashSet<CanonicalSegment>) {
     if polygons.is_empty() {
@@ -1279,7 +1450,7 @@ fn classify_segments(
 
 fn classify_segments_from_graph(
     unique_segments: &[CanonicalSegment],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> (HashSet<CanonicalSegment>, HashSet<CanonicalSegment>) {
     let adjacency = build_adjacency(unique_segments, point_positions);
     let component_map = compute_components(&adjacency);
@@ -1317,11 +1488,11 @@ fn classify_segments_from_graph(
 fn segment_side_states_with_polygons(
     segment: CanonicalSegment,
     polygon_index: &PolygonIndex,
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
     sample_cache: &mut HashMap<SamplePointKey, bool>,
 ) -> (bool, bool) {
-    let a = point_positions[&segment.start];
-    let b = point_positions[&segment.end];
+    let a = point_position(point_positions, segment.start);
+    let b = point_position(point_positions, segment.end);
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     let len = (dx * dx + dy * dy).sqrt();
@@ -1343,10 +1514,10 @@ fn segment_side_states_with_polygons(
 fn segment_side_states(
     segment: CanonicalSegment,
     faces: &[FaceLoop],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> (bool, bool) {
-    let a = point_positions[&segment.start];
-    let b = point_positions[&segment.end];
+    let a = point_position(point_positions, segment.start);
+    let b = point_position(point_positions, segment.end);
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     let len = (dx * dx + dy * dy).sqrt();
@@ -1367,7 +1538,7 @@ fn segment_side_states(
 
 fn build_adjacency(
     unique_segments: &[CanonicalSegment],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> HashMap<QPoint, Vec<QPoint>> {
     let mut adjacency: HashMap<QPoint, Vec<QPoint>> = HashMap::new();
     for segment in unique_segments {
@@ -1382,10 +1553,10 @@ fn build_adjacency(
     }
 
     for (point, neighbors) in &mut adjacency {
-        let origin = point_positions[point];
+        let origin = point_position(point_positions, *point);
         neighbors.sort_by(|lhs, rhs| {
-            let left = point_positions[lhs];
-            let right = point_positions[rhs];
+            let left = point_position(point_positions, *lhs);
+            let right = point_position(point_positions, *rhs);
             let left_angle = (left[1] - origin[1]).atan2(left[0] - origin[0]);
             let right_angle = (right[1] - origin[1]).atan2(right[0] - origin[0]);
             left_angle.total_cmp(&right_angle)
@@ -1430,7 +1601,7 @@ fn extract_filled_faces(
     unique_segments: &[CanonicalSegment],
     adjacency: &HashMap<QPoint, Vec<QPoint>>,
     component_map: &HashMap<QPoint, usize>,
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> Vec<FaceLoop> {
     let mut visited = HashSet::new();
     let mut faces = Vec::new();
@@ -1543,7 +1714,7 @@ fn next_half_edge(
 fn point_in_faces(
     point: [f32; 2],
     faces: &[FaceLoop],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> bool {
     let mut inside = false;
     for face in faces {
@@ -1576,7 +1747,7 @@ fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
         .iter()
         .map(|polygon| polygon.bounds)
         .collect::<Vec<_>>();
-    let grid = build_uniform_grid(&bounds, 0.0);
+    let grid = build_dense_grid(&bounds, 0.0, default_grid_resolution(bounds.len()));
     PolygonIndex {
         polygons: indexed_polygons,
         grid,
@@ -1600,29 +1771,27 @@ fn point_in_polygons(
         return *is_inside;
     }
 
-    let mut is_inside = false;
-    for &polygon_index_id in grid_candidates_for_point(&polygon_index.grid, point) {
+    for &polygon_index_id in dense_grid_candidates_for_point(&polygon_index.grid, point) {
         let polygon = &polygon_index.polygons[polygon_index_id];
         if !bounds_contains_point(polygon.bounds, point) {
             continue;
         }
         if point_in_polygon_points(point, &polygon.points) {
-            is_inside = true;
-            break;
+            sample_cache.insert(key, true);
+            return true;
         }
     }
-
-    sample_cache.insert(key, is_inside);
-    is_inside
+    sample_cache.insert(key, false);
+    false
 }
 
-fn grid_candidates_for_point(grid: &UniformGridIndex, point: [f32; 2]) -> &[usize] {
+fn dense_grid_candidates_for_point(grid: &DenseGridIndex, point: [f32; 2]) -> &[usize] {
     let x = cell_coord(point[0], grid.min[0], grid.cell_size[0], grid.resolution);
     let y = cell_coord(point[1], grid.min[1], grid.cell_size[1], grid.resolution);
-    match grid.cells.get(&(x, y)) {
-        Some(indices) => indices.as_slice(),
-        None => &[],
-    }
+    let cell_index = dense_cell_index(x, y, grid.resolution);
+    let start = grid.cell_starts[cell_index];
+    let end = grid.cell_starts[cell_index + 1];
+    &grid.indices[start..end]
 }
 
 fn bounds_contains_point(bounds: SegmentBounds, point: [f32; 2]) -> bool {
@@ -1633,6 +1802,10 @@ fn bounds_contains_point(bounds: SegmentBounds, point: [f32; 2]) -> bool {
 }
 
 fn point_in_polygon_points(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
+    if polygon.len() == 3 {
+        return point_in_triangle(point, polygon[0], polygon[1], polygon[2]);
+    }
+
     let mut inside = false;
     let mut previous = polygon.last().copied().expect("polygon is non-empty");
     for &current in polygon {
@@ -1649,15 +1822,27 @@ fn point_in_polygon_points(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
     inside
 }
 
+fn point_in_triangle(point: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let ab = orientation(a, b, point);
+    let bc = orientation(b, c, point);
+    let ca = orientation(c, a, point);
+    let has_negative = ab < -AREA_EPSILON || bc < -AREA_EPSILON || ca < -AREA_EPSILON;
+    let has_positive = ab > AREA_EPSILON || bc > AREA_EPSILON || ca > AREA_EPSILON;
+    !(has_negative && has_positive)
+}
+
 fn point_in_polygon(
     point: [f32; 2],
     polygon: &[QPoint],
-    point_positions: &HashMap<QPoint, [f32; 2]>,
+    point_positions: &PointPositionIndex,
 ) -> bool {
     let mut inside = false;
-    let mut previous = point_positions[polygon.last().expect("polygon is non-empty")];
+    let mut previous = point_position(
+        point_positions,
+        *polygon.last().expect("polygon is non-empty"),
+    );
     for vertex in polygon {
-        let current = point_positions[vertex];
+        let current = point_position(point_positions, *vertex);
         let intersects = ((current[1] > point[1]) != (previous[1] > point[1]))
             && (point[0]
                 < (previous[0] - current[0]) * (point[1] - current[1])
@@ -1681,11 +1866,11 @@ fn point_in_polygons_bruteforce(point: [f32; 2], polygons: &[Polygon]) -> bool {
     false
 }
 
-fn polygon_area(points: &[QPoint], point_positions: &HashMap<QPoint, [f32; 2]>) -> f32 {
+fn polygon_area(points: &[QPoint], point_positions: &PointPositionIndex) -> f32 {
     let mut area = 0.0;
     for idx in 0..points.len() {
-        let current = point_positions[&points[idx]];
-        let next = point_positions[&points[(idx + 1) % points.len()]];
+        let current = point_position(point_positions, points[idx]);
+        let next = point_position(point_positions, points[(idx + 1) % points.len()]);
         area += current[0] * next[1] - next[0] * current[1];
     }
     area * 0.5
@@ -2127,7 +2312,7 @@ fn compact_payload_from_buffers(
         styles,
         arrangement_input_segments: original_segments,
         arrangement_input_group_segments: group_segments,
-        point_positions,
+        point_positions: Arc::new(point_positions),
         polygons,
         padding_warning,
     })
@@ -2606,6 +2791,114 @@ mod tests {
         assert!(paths.iter().any(|path| path == &vec![a, b] || path == &vec![b, a]));
         assert!(paths.iter().any(|path| path == &vec![b, c] || path == &vec![c, b]));
         assert!(paths.iter().any(|path| path == &vec![b, d] || path == &vec![d, b]));
+    }
+
+    fn arrangement_from_segments(
+        segments: &[([f32; 2], [f32; 2])],
+    ) -> SegmentArrangement {
+        let original_segments = segments
+            .iter()
+            .map(|(start, end)| canonical_segment(quantize_point(*start), quantize_point(*end)).unwrap())
+            .collect::<Vec<_>>();
+        let mut point_positions = HashMap::new();
+        for (start, end) in segments {
+            point_positions.entry(quantize_point(*start)).or_insert(*start);
+            point_positions.entry(quantize_point(*end)).or_insert(*end);
+        }
+        let group_segments = vec![original_segments.clone()];
+        build_segment_arrangement_from_parts(
+            original_segments,
+            Arc::new(point_positions),
+            &group_segments,
+        )
+    }
+
+    #[test]
+    fn test_arrangement_shared_endpoint_does_not_split() {
+        let arrangement = arrangement_from_segments(&[
+            ([0.0, 0.0], [1.0, 0.0]),
+            ([1.0, 0.0], [1.0, 1.0]),
+        ]);
+        assert_eq!(arrangement.segments.len(), 2);
+        assert_eq!(arrangement.group_segments.len(), 1);
+        assert_eq!(arrangement.group_segments[0].len(), 2);
+    }
+
+    #[test]
+    fn test_arrangement_t_junction_splits_only_trunk() {
+        let arrangement = arrangement_from_segments(&[
+            ([0.0, 0.0], [1.0, 0.0]),
+            ([0.5, 0.0], [0.5, 1.0]),
+        ]);
+        assert_eq!(arrangement.segments.len(), 3);
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.0, 0.0]),
+            quantize_point([0.5, 0.0]),
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.5, 0.0]),
+            quantize_point([1.0, 0.0]),
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.5, 0.0]),
+            quantize_point([0.5, 1.0]),
+        ).unwrap()));
+    }
+
+    #[test]
+    fn test_arrangement_crossing_splits_both_segments() {
+        let arrangement = arrangement_from_segments(&[
+            ([0.0, 0.0], [1.0, 1.0]),
+            ([0.0, 1.0], [1.0, 0.0]),
+        ]);
+        assert_eq!(arrangement.segments.len(), 4);
+        let center = quantize_point([0.5, 0.5]);
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.0, 0.0]),
+            center,
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            center,
+            quantize_point([1.0, 1.0]),
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.0, 1.0]),
+            center,
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            center,
+            quantize_point([1.0, 0.0]),
+        ).unwrap()));
+    }
+
+    #[test]
+    fn test_arrangement_colinear_endpoint_touch_does_not_split() {
+        let arrangement = arrangement_from_segments(&[
+            ([0.0, 0.0], [1.0, 0.0]),
+            ([1.0, 0.0], [2.0, 0.0]),
+        ]);
+        assert_eq!(arrangement.segments.len(), 2);
+    }
+
+    #[test]
+    fn test_arrangement_colinear_overlap_splits_internal_boundaries_only() {
+        let arrangement = arrangement_from_segments(&[
+            ([0.0, 0.0], [2.0, 0.0]),
+            ([1.0, 0.0], [3.0, 0.0]),
+        ]);
+        assert_eq!(arrangement.segments.len(), 3);
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([0.0, 0.0]),
+            quantize_point([1.0, 0.0]),
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([1.0, 0.0]),
+            quantize_point([2.0, 0.0]),
+        ).unwrap()));
+        assert!(arrangement.segments.contains(&canonical_segment(
+            quantize_point([2.0, 0.0]),
+            quantize_point([3.0, 0.0]),
+        ).unwrap()));
     }
 
     #[test]

@@ -5,6 +5,10 @@ import sys
 import tempfile
 import textwrap
 import time
+try:
+    from concurrent import futures
+except Exception:
+    futures = None
 
 from maya import (
     cmds,
@@ -49,6 +53,7 @@ PREVIEW_MAX_DIMENSION = 512
 WARNING_COLOR = (1.0, 0.25, 0.25)
 WARNING_WIDTH = 4
 PREVIEW_DEBOUNCE_MS = 150
+PREVIEW_RENDER_WORKERS = 1
 
 
 try:
@@ -60,69 +65,229 @@ except Exception:
         QtCore = None  # type: ignore
 
 
-class PreviewRefreshController(object):
-    """Serialize expensive preview refreshes and debounce drag updates."""
+class AsyncPreviewController(object):
+    """Keep preview refreshes off the main thread when cache is warm."""
 
-    def __init__(self, callback):
-        # type: (Callable[[], None]) -> None
-        self.callback = callback
-        self._running = False
-        self._rerun_requested = False
+    def __init__(self):
+        # type: () -> None
+        self._executor = futures.ThreadPoolExecutor(max_workers=PREVIEW_RENDER_WORKERS) if futures is not None else None
+        self._request_generation = 0
+        self._latest_installed_generation = 0
+        self._pending_request = None
+        self._running_future = None
+        self._running_generation = None
+        self._main_tick_scheduled = False
+        self._closed = False
+        self._preview_paths = set()
+        self._warmup_sessions = []
         self._timer = None
         if QtCore is not None:
             self._timer = QtCore.QTimer()
             self._timer.setSingleShot(True)
-            self._timer.timeout.connect(self._run)
+            self._timer.timeout.connect(self._enqueue_refresh)
 
     def request_refresh(self, immediate=False):
         # type: (bool) -> None
-        if self._running:
-            self._rerun_requested = True
-            if immediate and self._timer is not None:
-                self._timer.start(0)
+        if self._closed:
             return
 
         if immediate or self._timer is None:
-            self._run()
+            self._enqueue_refresh()
         else:
             self._timer.start(PREVIEW_DEBOUNCE_MS)
 
-    def _run(self):
+    def close(self):
+        # type: () -> None
+        self._closed = True
+        self._pending_request = None
+        self._warmup_sessions = []
+        self._main_tick_scheduled = False
+        try:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+        for path in list(self._preview_paths):
+            _delete_preview_path(path)
+        self._preview_paths.clear()
+
+    def _enqueue_refresh(self):
         # type: () -> None
         if not cmds.window("settingsWindow", exists=True):
             return
 
-        if self._running:
-            self._rerun_requested = True
+        self._request_generation += 1
+        request, error_message, missing_meshes = _capture_preview_request(self._request_generation)
+        if error_message:
+            self._pending_request = None
+            self._warmup_sessions = []
+            _set_preview_placeholder(error_message)
             return
 
-        self._running = True
+        self._pending_request = request
+        if missing_meshes:
+            self._warmup_sessions = [
+                drawer.start_mesh_topology_build_session(mesh_name)
+                for mesh_name in missing_meshes
+            ]
+            _set_preview_busy("Warming cache...")
+            self._schedule_main_tick()
+            return
+
+        self._warmup_sessions = []
+        self._maybe_start_render()
+
+    def process_events(self):
+        # type: () -> None
+        self._main_tick_scheduled = False
+        if self._closed or not cmds.window("settingsWindow", exists=True):
+            return
+
+        if self._running_future is not None and self._running_future.done():
+            self._handle_render_completion()
+
+        if self._closed or not cmds.window("settingsWindow", exists=True):
+            return
+
+        if self._running_future is not None:
+            self._schedule_main_tick()
+            return
+
+        if self._warmup_sessions:
+            self._step_warmup_sessions()
+            if self._warmup_sessions:
+                self._schedule_main_tick()
+                return
+
+        if self._pending_request is not None:
+            self._maybe_start_render()
+            if self._running_future is not None:
+                self._schedule_main_tick()
+
+    def _schedule_main_tick(self):
+        # type: () -> None
+        if self._main_tick_scheduled or self._closed:
+            return
+        self._main_tick_scheduled = True
+        cmds.evalDeferred("import uv_snapshot_edge_drawer.ui as ui; ui._process_async_preview_controller()")
+
+    def _step_warmup_sessions(self):
+        # type: () -> None
+        remaining = []
+        for session in self._warmup_sessions:
+            if session.step():
+                continue
+            remaining.append(session)
+
+        self._warmup_sessions = remaining
+        if self._warmup_sessions:
+            _set_preview_busy("Warming cache...")
+            return
+
+        if self._pending_request is None:
+            return
+
+        snapshots = []
+        for mesh_name in self._pending_request["mesh_names"]:
+            snapshot = drawer.get_cached_mesh_topology_snapshot(mesh_name)
+            if snapshot is None:
+                self._warmup_sessions = [drawer.start_mesh_topology_build_session(mesh_name)]
+                _set_preview_busy("Warming cache...")
+                return
+            snapshots.append(snapshot)
+
+        self._pending_request["snapshots"] = snapshots
+
+    def _maybe_start_render(self):
+        # type: () -> None
+        if self._running_future is not None or self._pending_request is None:
+            return
+
+        request = self._pending_request
+        if not request.get("snapshots"):
+            _set_preview_busy("Warming cache...")
+            return
+
+        self._pending_request = None
+        self._running_generation = request["generation"]
+        preview_path = _get_preview_path(request["generation"])
+        self._preview_paths.add(preview_path)
+        _set_preview_busy("Rendering preview...")
+        if self._executor is None:
+            try:
+                result = _render_preview_job(request, preview_path)
+            except Exception as exc:
+                _set_preview_busy("Preview failed: {}".format(exc))
+                return
+            self._latest_installed_generation = result["generation"]
+            _set_preview_image(result["image_path"], result["width"], result["height"])
+            self._cleanup_stale_preview_paths(result["image_path"])
+            return
+
+        self._running_future = self._executor.submit(_render_preview_job, request, preview_path)
+        self._schedule_main_tick()
+
+    def _handle_render_completion(self):
+        # type: () -> None
+        future = self._running_future
+        generation = self._running_generation
+        self._running_future = None
+        self._running_generation = None
+
         try:
-            self.callback()
-        finally:
-            self._running = False
-            if self._rerun_requested:
-                self._rerun_requested = False
-                if self._timer is not None:
-                    self._timer.start(0)
-                else:
-                    self._run()
+            result = future.result()
+        except Exception as exc:
+            if generation == self._request_generation:
+                _set_preview_busy("Preview failed: {}".format(exc))
+            return
+
+        if result["generation"] != self._request_generation or self._closed:
+            _delete_preview_path(result["image_path"])
+            self._preview_paths.discard(result["image_path"])
+            return
+
+        self._latest_installed_generation = result["generation"]
+        _set_preview_image(result["image_path"], result["width"], result["height"])
+        self._cleanup_stale_preview_paths(result["image_path"])
+
+    def _cleanup_stale_preview_paths(self, keep_path):
+        # type: (Text) -> None
+        stale_paths = [path for path in self._preview_paths if path != keep_path]
+        for path in stale_paths:
+            _delete_preview_path(path)
+            self._preview_paths.discard(path)
 
 
 _preview_refresh_controller = None
 
 
 def _get_preview_refresh_controller():
-    # type: () -> PreviewRefreshController
+    # type: () -> AsyncPreviewController
     global _preview_refresh_controller
     if _preview_refresh_controller is None:
-        _preview_refresh_controller = PreviewRefreshController(_refresh_preview_now)
+        _preview_refresh_controller = AsyncPreviewController()
     return _preview_refresh_controller
 
 
 def schedule_preview_refresh(immediate=False):
     # type: (bool) -> None
     _get_preview_refresh_controller().request_refresh(immediate=immediate)
+
+
+def _process_async_preview_controller():
+    # type: () -> None
+    if _preview_refresh_controller is None:
+        return
+    _preview_refresh_controller.process_events()
+
+
+def _close_async_preview_controller():
+    # type: () -> None
+    global _preview_refresh_controller
+    if _preview_refresh_controller is not None:
+        _preview_refresh_controller.close()
+        _preview_refresh_controller = None
 
 
 def _edge_control_name(edge_key, suffix):
@@ -377,9 +542,18 @@ def _set_edge_row_enabled(edge_key, enabled):
     cmds.intSlider(_edge_control_name(edge_key, "OutlineWidthSlider"), edit=True, enable=enabled)
 
 
-def _get_preview_path():
-    # type: () -> Text
-    return os.path.join(tempfile.gettempdir(), "uv_snapshot_plus_preview.png")
+def _get_preview_path(generation):
+    # type: (int) -> Text
+    return os.path.join(tempfile.gettempdir(), "uv_snapshot_plus_preview_{}.png".format(generation))
+
+
+def _delete_preview_path(image_path):
+    # type: (Text) -> None
+    try:
+        if image_path and os.path.exists(image_path):
+            os.unlink(image_path)
+    except OSError:
+        pass
 
 
 def _pick_warning_color(*_args):
@@ -397,6 +571,11 @@ def _get_warning_color():
     return tuple(
         cmds.button("paddingWarningColorSwatch", query=True, backgroundColor=True)
     )
+
+
+def _collect_selected_meshes():
+    # type: () -> List[Text]
+    return cmds.ls(sl=True, dag=True, type="mesh", long=True) or []
 
 
 def _collect_snapshot_settings():
@@ -531,22 +710,17 @@ def _build_padding_warning_settings(settings, width_scale=1.0):
     }
 
 
-def _build_snapshot_json(settings, width_scale=1.0):
-    # type: (Dict[Text, Any], float) -> Tuple[Optional[Text], Optional[Text]]
+def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
+    # type: (Dict[Text, Any], List[Any], float) -> Any
     started_at = time.time()
-    mesh = cmds.ls(sl=True, dag=True, type="mesh", long=True)
-    if not mesh:
-        return None, "Select a mesh to preview"
-
     config = _build_drawer_config(settings, width_scale=width_scale)
     u_min, u_max, v_min, v_max = settings["uv_min_max"]
     tmp_json = []
     tmp_polygons = []
-    for mesh_name in mesh:
-        edges = drawer.MeshEdges(mesh_name, config)
-        draw_info = edges.get_draw_info(u_min, u_max, v_min, v_max)
+    for snapshot in snapshots:
+        draw_info = snapshot.get_draw_info(config, u_min, u_max, v_min, v_max)
         tmp_json.extend(list(draw_info.values()))
-        tmp_polygons.extend(_get_uv_face_polygons(mesh_name, u_min, u_max, v_min, v_max))
+        tmp_polygons.extend(snapshot.get_polygons(u_min, u_max, v_min, v_max))
 
     padding_warning = _build_padding_warning_settings(settings, width_scale=width_scale)
     payload = {
@@ -559,7 +733,46 @@ def _build_snapshot_json(settings, width_scale=1.0):
     payload_data = drawer.build_drawer_payload_buffers(payload)
     if drawer.PROFILE_ENABLED:
         print("uv_snapshot_edge_drawer: build snapshot payload {:.4f}s".format(time.time() - started_at))
-    return payload_data, None
+    return payload_data
+
+
+def _build_snapshot_json(settings, width_scale=1.0):
+    # type: (Dict[Text, Any], float) -> Tuple[Optional[Text], Optional[Text]]
+    mesh_names = _collect_selected_meshes()
+    if not mesh_names:
+        return None, "Select a mesh to preview"
+
+    snapshots = [drawer.get_mesh_topology_snapshot(mesh_name) for mesh_name in mesh_names]
+    return _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale), None
+
+
+def _capture_preview_request(generation):
+    # type: (int) -> Tuple[Optional[Dict[Text, Any]], Optional[Text], List[Text]]
+    settings = _collect_snapshot_settings()
+    mesh_names = _collect_selected_meshes()
+    if not mesh_names:
+        return None, "Select a mesh to preview", []
+
+    preview_width, preview_height = _get_preview_dimensions(settings)
+    width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
+    snapshots = []
+    missing_meshes = []
+    for mesh_name in mesh_names:
+        snapshot = drawer.get_cached_mesh_topology_snapshot(mesh_name)
+        if snapshot is None:
+            missing_meshes.append(mesh_name)
+        else:
+            snapshots.append(snapshot)
+
+    return {
+        "generation": generation,
+        "settings": settings,
+        "mesh_names": mesh_names,
+        "snapshots": snapshots if not missing_meshes else [],
+        "preview_width": preview_width,
+        "preview_height": preview_height,
+        "width_scale": width_scale,
+    }, None, missing_meshes
 
 
 def _get_preview_dimensions(settings):
@@ -576,6 +789,11 @@ def _set_preview_placeholder(message):
     cmds.text("previewStatus", edit=True, visible=True, label=message)
 
 
+def _set_preview_busy(message):
+    # type: (Text) -> None
+    cmds.text("previewStatus", edit=True, visible=True, label=message)
+
+
 def _set_preview_image(image_path, width, height):
     # type: (Text, int, int) -> None
     cmds.text("previewStatus", edit=True, visible=False)
@@ -589,40 +807,33 @@ def _set_preview_image(image_path, width, height):
     )
 
 
-def _refresh_preview_now():
-    # type: () -> None
-    # type: (*Any) -> None
+def _render_preview_job(request, preview_path):
+    # type: (Dict[Text, Any], Text) -> Dict[Text, Any]
     started_at = time.time()
-    settings = _collect_snapshot_settings()
-    preview_width, preview_height = _get_preview_dimensions(settings)
-    width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
-    json_data, error_message = _build_snapshot_json(settings, width_scale=width_scale)
-    if error_message:
-        _set_preview_placeholder(error_message)
-        return
-
-    preview_path = _get_preview_path()
-
-    try:
-        drawer.execute_drawer(
-            preview_path,
-            preview_width,
-            preview_height,
-            json_data,
-            open_after_save=False,
-        )
-    except Exception as exc:
-        _set_preview_placeholder("Preview failed: {}".format(exc))
-        return
-
-    _set_preview_image(preview_path, preview_width, preview_height)
+    payload_data = _build_payload_from_snapshots(
+        request["settings"],
+        request["snapshots"],
+        width_scale=request["width_scale"],
+    )
+    drawer.render_payload_to_path(
+        preview_path,
+        request["preview_width"],
+        request["preview_height"],
+        payload_data,
+    )
     if drawer.PROFILE_ENABLED:
         print("uv_snapshot_edge_drawer: refresh preview {:.4f}s".format(time.time() - started_at))
+    return {
+        "generation": request["generation"],
+        "image_path": preview_path,
+        "width": request["preview_width"],
+        "height": request["preview_height"],
+    }
 
 
 def refresh_preview(*args):
     # type: (*Any) -> None
-    _refresh_preview_now()
+    schedule_preview_refresh(immediate=True)
 
 
 def _on_edge_mode_changed(edge_key):
@@ -896,7 +1107,7 @@ def show_ui():
 
     # Show the window
     uv_snapchot_ctrl_changed()
-    cmds.scriptJob(uiDeleted=("settingsWindow", "import uv_snapshot_edge_drawer as drawer; drawer.clear_mesh_topology_cache()"))
+    cmds.scriptJob(uiDeleted=("settingsWindow", "import uv_snapshot_edge_drawer as drawer; import uv_snapshot_edge_drawer.ui as ui; ui._close_async_preview_controller(); drawer.clear_mesh_topology_cache()"))
     cmds.showWindow(settingsWindow)
     schedule_preview_refresh(immediate=True)
 
