@@ -14,9 +14,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODULE_DIR = REPO_ROOT / "build" / "MayaUvSnapshotPlus"
 DEFAULT_DIST_DIR = REPO_ROOT / "dist"
-DEFAULT_ZIP_NAME = "mayauvsnapshotplus.zip"
+DEFAULT_ZIP_BASENAME = "mayauvsnapshotplus"
 MODULE_FILE = REPO_ROOT / "MayaUvSnapshotPlus.mod"
 USER_SETUP_FILE = REPO_ROOT / "python" / "userSetup.py"
+README_FILE = REPO_ROOT / "README.md"
+LICENSE_FILE = REPO_ROOT / "LICENSE"
 PYTHON_INSTALLER_CACHE_DIR = REPO_ROOT / "build" / "python-installers"
 COMMON_BUILD_FEATURE = "maya-abi3-py39"
 WINDOWS_PYTHON_PATCH_VERSIONS = {
@@ -45,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--zip-name",
-        default=DEFAULT_ZIP_NAME,
-        help="Output zip filename.",
+        default=None,
+        help="Output zip filename. Defaults to mayauvsnapshotplus_<tag>.zip when a git tag is available.",
     )
     parser.add_argument(
         "--skip-zip",
@@ -215,6 +217,36 @@ def build_env(python_executable: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["PYO3_PYTHON"] = str(python_executable)
     return env
+
+
+def resolve_release_tag() -> str | None:
+    commands = (
+        ["git", "describe", "--tags", "--exact-match"],
+        ["git", "describe", "--tags", "--abbrev=0"],
+    )
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+
+        tag = result.stdout.strip()
+        if tag:
+            return tag
+    return None
+
+
+def default_zip_name() -> str:
+    tag = resolve_release_tag()
+    if not tag:
+        return f"{DEFAULT_ZIP_BASENAME}.zip"
+    return f"{DEFAULT_ZIP_BASENAME}_{tag}.zip"
 
 
 def module_root_from_platform_path(platform_path: str) -> str:
@@ -407,6 +439,8 @@ def build_zip(module_dir: Path, dist_dir: Path, zip_name: str) -> Path:
             if path.is_file():
                 archive.write(path, path.relative_to(module_dir.parent))
         archive.write(MODULE_FILE, MODULE_FILE.name)
+        archive.write(README_FILE, README_FILE.name)
+        archive.write(LICENSE_FILE, "LICENSE.md")
 
     return zip_path
 
@@ -470,7 +504,8 @@ def main() -> int:
     if args.skip_zip:
         return 0
 
-    zip_path = build_zip(module_dir, dist_dir, args.zip_name)
+    zip_name = args.zip_name or default_zip_name()
+    zip_path = build_zip(module_dir, dist_dir, zip_name)
     print(f"Zip archive: {zip_path}")
     return 0
 
