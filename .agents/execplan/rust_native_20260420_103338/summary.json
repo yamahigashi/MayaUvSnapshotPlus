@@ -1,0 +1,149 @@
+{
+  "run_id": "rust_native_20260420_103338",
+  "git_head": "68defc1",
+  "workload": {
+    "command": "EDGE_DRAWER_PROFILE=1 rust/edge_drawer/target/release/edge_drawer <out.png> 2048 2048 .agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "fixture": ".agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "width": 2048,
+    "height": 2048,
+    "build_mode": "release",
+    "profile_env": "EDGE_DRAWER_PROFILE=1",
+    "primary_metric": "prepare_total"
+  },
+  "baseline": {
+    "prepare_total": [0.3665, 0.3629, 0.3572],
+    "arrangement": [0.1490, 0.1467, 0.1454],
+    "classification": [0.1376, 0.1351, 0.1333],
+    "path_build": [0.0761, 0.0772, 0.0751],
+    "render_raster": [0.1067, 0.1062, 0.1103]
+  },
+  "baseline_attribution": {
+    "arrangement_collect_segments": 0.0262,
+    "arrangement_collect_original_dedup": 0.0082,
+    "arrangement_collect_group_indices": 0.0027,
+    "arrangement_collect_inputs": 0.0400,
+    "arrangement_setup": 0.0116,
+    "pair_stats": {
+      "resolution": 256,
+      "cells": 436402,
+      "dense_candidates": 5606060,
+      "ordered_candidates": 5606060,
+      "duplicates": 1289889,
+      "overlaps": 1162169
+    },
+    "arrangement_pairs": 0.0732,
+    "split_stats": {
+      "segments": 102833,
+      "raw_points": 272946,
+      "unique_points": 228466,
+      "duplicates": 44480,
+      "max_points_per_segment": 95
+    },
+    "arrangement_finalize_split_segments": 0.0065,
+    "arrangement_finalize_segments_rebuild": 0.0038,
+    "arrangement_finalize_group_rebuild": 0.0049,
+    "arrangement_finalize": 0.0178,
+    "arrangement": 0.1692,
+    "classification": 0.1372,
+    "path_build": 0.0665,
+    "prepare_total": 0.3762,
+    "render_raster": 0.1065
+  },
+  "rejected_iteration": {
+    "change": "Lower candidate-pair grid resolution after a same-workload sweep.",
+    "best_sweep_sample": {
+      "resolution": 128,
+      "arrangement_pairs": 0.0780,
+      "arrangement": 0.1777,
+      "classification": 0.1375,
+      "path_build": 0.0780,
+      "prepare_total": 0.3965,
+      "render_raster": 0.1113
+    },
+    "rejected_validation": {
+      "prepare_total": [0.3781, 0.4024, 0.3842],
+      "arrangement": [0.1542, 0.1590, 0.1536],
+      "classification": [0.1416, 0.1526, 0.1467],
+      "path_build": [0.0787, 0.0867, 0.0801],
+      "render_raster": [0.1114, 0.1150, 0.1139]
+    },
+    "reason": "A sweep-guided single-sample improvement did not reproduce on a fixed 3-run validation, regressing prepare_total."
+  },
+  "accepted_final_validation": {
+    "change": "Share polygon-grid candidate traversal between the left and right side-sample points when both land in the same dense-grid cell.",
+    "prepare_total": [0.3622, 0.3515, 0.3500],
+    "arrangement": [0.1529, 0.1507, 0.1471],
+    "classification": [0.1279, 0.1264, 0.1270],
+    "path_build": [0.0775, 0.0705, 0.0722],
+    "render_raster": [0.1079, 0.1096, 0.1104]
+  },
+  "extra_validation": {
+    "prepare_total": [0.3582, 0.3395, 0.3539],
+    "arrangement": [0.1492, 0.1459, 0.1452],
+    "classification": [0.1270, 0.1217, 0.1290],
+    "path_build": [0.0785, 0.0683, 0.0761],
+    "render_raster": [0.1068, 0.1055, 0.1099]
+  },
+  "post_change_attribution_sample": {
+    "arrangement_collect_segments": 0.0234,
+    "arrangement_collect_original_dedup": 0.0079,
+    "arrangement_collect_group_indices": 0.0027,
+    "arrangement_collect_inputs": 0.0371,
+    "arrangement_setup": 0.0101,
+    "pair_stats": {
+      "resolution": 256,
+      "cells": 436402,
+      "dense_candidates": 5606060,
+      "ordered_candidates": 5606060,
+      "duplicates": 1289889,
+      "overlaps": 1162169
+    },
+    "arrangement_pairs": 0.0751,
+    "split_stats": {
+      "segments": 102833,
+      "raw_points": 272946,
+      "unique_points": 228466,
+      "duplicates": 44480,
+      "max_points_per_segment": 95
+    },
+    "arrangement_finalize_split_segments": 0.0060,
+    "arrangement_finalize_segments_rebuild": 0.0039,
+    "arrangement_finalize_group_rebuild": 0.0048,
+    "arrangement_finalize": 0.0175,
+    "arrangement": 0.1657,
+    "classification_stats": {
+      "sample_queries": 799152,
+      "candidate_polygons": 65441362,
+      "bounds_checks": 6850986,
+      "point_tests": 1520083
+    },
+    "classification": 0.1268,
+    "path_build": 0.0815,
+    "prepare_total": 0.3771,
+    "render_raster": 0.1101
+  },
+  "comparison": {
+    "prepare_total_mean_baseline": 0.3622,
+    "prepare_total_mean_final_first_validation": 0.3545666667,
+    "prepare_total_mean_final_combined": 0.35255,
+    "prepare_total_abs_combined": -0.00965,
+    "prepare_total_pct_combined": -2.6642738818,
+    "arrangement_mean_baseline": 0.1470333333,
+    "arrangement_mean_final_combined": 0.1485,
+    "arrangement_abs_combined": 0.0014666667,
+    "arrangement_pct_combined": 0.9975062344,
+    "classification_mean_baseline": 0.1353333333,
+    "classification_mean_final_combined": 0.1265,
+    "classification_abs_combined": -0.0088333333,
+    "classification_pct_combined": -6.5270935961,
+    "path_build_mean_baseline": 0.0761333333,
+    "path_build_mean_final_combined": 0.07385,
+    "path_build_abs_combined": -0.0022833333,
+    "path_build_pct_combined": -2.9991243433,
+    "render_raster_mean_baseline": 0.1077333333,
+    "render_raster_mean_final_combined": 0.10835,
+    "render_raster_abs_combined": 0.0006166667,
+    "render_raster_pct_combined": 0.5724009901
+  },
+  "confidence_note": "A pair-grid tuning attempt was rejected after it regressed on fixed 3-run validation. The accepted classification-side change improved the first 3-run validation sample and a second 3-run sample in the same direction, bringing the combined prepare_total mean down by 2.66%."
+}
