@@ -649,22 +649,6 @@ fn build_segment_arrangement_from_parts(
     }
 }
 
-fn append_split_point_if_interior(
-    split_points: &mut Vec<QPoint>,
-    segment: CanonicalSegment,
-    point: QPoint,
-) -> bool {
-    if is_segment_endpoint(segment, point) {
-        return false;
-    }
-
-    if !split_points.contains(&point) {
-        split_points.push(point);
-        return true;
-    }
-    false
-}
-
 fn register_pair_splits(
     left: CanonicalSegment,
     right: CanonicalSegment,
@@ -753,9 +737,11 @@ fn register_split_point_for_segment(
     point: [f32; 2],
 ) {
     let quantized = quantize_point(point);
-    if append_split_point_if_interior(split_points, segment, quantized) {
-        insert_point_position(point_positions, quantized, point);
+    if is_segment_endpoint(segment, quantized) {
+        return;
     }
+    split_points.push(quantized);
+    insert_point_position(point_positions, quantized, point);
 }
 
 fn is_segment_endpoint(segment: CanonicalSegment, point: QPoint) -> bool {
@@ -788,8 +774,12 @@ fn split_segment(
     if split_points.is_empty() {
         return vec![original];
     }
-    if split_points.len() == 1 {
-        let point = split_points[0];
+    let mut unique_split_points = split_points.to_vec();
+    unique_split_points.sort_unstable();
+    unique_split_points.dedup();
+
+    if unique_split_points.len() == 1 {
+        let point = unique_split_points[0];
         let mut segments = Vec::with_capacity(2);
         if let Some(segment) = canonical_segment(original.start, point) {
             segments.push(segment);
@@ -800,10 +790,10 @@ fn split_segment(
         return segments;
     }
 
-    let mut ordered = Vec::with_capacity(split_points.len() + 2);
+    let mut ordered = Vec::with_capacity(unique_split_points.len() + 2);
     ordered.push(original.start);
     ordered.push(original.end);
-    ordered.extend(split_points.iter().copied());
+    ordered.extend(unique_split_points);
     ordered.sort_by(|lhs, rhs| {
         segment_parameter(point_position(point_positions, *lhs), start, end).total_cmp(
             &segment_parameter(point_position(point_positions, *rhs), start, end),
@@ -1014,10 +1004,7 @@ fn materialize_style_buckets(
 }
 
 fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
-    let line_count = edges
-        .iter()
-        .map(|group| group.lines.len())
-        .sum::<usize>();
+    let line_count = edges.iter().map(|group| group.lines.len()).sum::<usize>();
     let mut point_positions = HashMap::with_capacity(line_count.saturating_mul(2));
     let mut original_set = HashSet::with_capacity(line_count);
     let mut group_segments = Vec::with_capacity(edges.len());
