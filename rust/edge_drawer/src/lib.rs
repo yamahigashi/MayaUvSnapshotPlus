@@ -146,6 +146,13 @@ struct SegmentArrangement {
     group_segments: Vec<Vec<CanonicalSegment>>,
 }
 
+#[derive(Debug)]
+struct ArrangementInputs {
+    point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
+    original_segments: Vec<CanonicalSegment>,
+    group_segments: Vec<Vec<CanonicalSegment>>,
+}
+
 #[derive(Clone, Debug)]
 struct CompactPayload {
     styles: Vec<DrawStyle>,
@@ -174,8 +181,8 @@ struct UniformGridIndex {
 }
 
 #[derive(Clone, Debug)]
-struct IndexedPolygon {
-    points: Vec<[f32; 2]>,
+struct IndexedPolygon<'a> {
+    points: &'a [[f32; 2]],
     bounds: SegmentBounds,
 }
 
@@ -189,8 +196,15 @@ struct DenseGridIndex {
 }
 
 #[derive(Clone, Debug)]
-struct PolygonIndex {
-    polygons: Vec<IndexedPolygon>,
+struct ArrangementGridIndex {
+    dense: DenseGridIndex,
+    segment_cell_starts: Vec<usize>,
+    segment_cells: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct PolygonIndex<'a> {
+    polygons: Vec<IndexedPolygon<'a>>,
     grid: DenseGridIndex,
 }
 
@@ -227,9 +241,31 @@ fn profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn pair_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_PAIR_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn split_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_SPLIT_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn arrangement_detail_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_ARRANGEMENT_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 fn log_profile(label: &str, started_at: Instant) {
     if profile_enabled() {
-        eprintln!("edge_drawer: {} {:.4}s", label, started_at.elapsed().as_secs_f64());
+        eprintln!(
+            "edge_drawer: {} {:.4}s",
+            label,
+            started_at.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -387,8 +423,11 @@ fn prepare_drawing(
     log_profile("arrangement", arrangement_started_at);
 
     let classification_started_at = Instant::now();
-    let (internal_segments, outline_segments) =
-        classify_segments(&arrangement.segments, &arrangement.point_positions, polygons);
+    let (internal_segments, outline_segments) = classify_segments(
+        &arrangement.segments,
+        &arrangement.point_positions,
+        polygons,
+    );
     log_profile("classification", classification_started_at);
 
     let warning_started_at = Instant::now();
@@ -446,8 +485,11 @@ fn prepare_drawing_from_compact(
     log_profile("arrangement", arrangement_started_at);
 
     let classification_started_at = Instant::now();
-    let (internal_segments, outline_segments) =
-        classify_segments(&arrangement.segments, &arrangement.point_positions, &payload.polygons);
+    let (internal_segments, outline_segments) = classify_segments(
+        &arrangement.segments,
+        &arrangement.point_positions,
+        &payload.polygons,
+    );
     log_profile("classification", classification_started_at);
 
     let warning_started_at = Instant::now();
@@ -491,21 +533,6 @@ fn prepare_drawing_from_compact(
     PreparedDrawing { groups }
 }
 
-fn collect_point_positions(edges: &[Edges]) -> HashMap<QPoint, [f32; 2]> {
-    let mut positions = HashMap::new();
-    for group in edges {
-        for line in &group.lines {
-            positions
-                .entry(quantize_point(line.uv1))
-                .or_insert(line.uv1);
-            positions
-                .entry(quantize_point(line.uv2))
-                .or_insert(line.uv2);
-        }
-    }
-    positions
-}
-
 fn point_position(point_positions: &PointPositionIndex, point: QPoint) -> [f32; 2] {
     point_positions
         .base
@@ -515,11 +542,7 @@ fn point_position(point_positions: &PointPositionIndex, point: QPoint) -> [f32; 
         .expect("point position must exist")
 }
 
-fn insert_point_position(
-    point_positions: &mut PointPositionIndex,
-    point: QPoint,
-    uv: [f32; 2],
-) {
+fn insert_point_position(point_positions: &mut PointPositionIndex, point: QPoint, uv: [f32; 2]) {
     if point_positions.base.contains_key(&point) || point_positions.extra.contains_key(&point) {
         return;
     }
@@ -527,24 +550,12 @@ fn insert_point_position(
 }
 
 fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
-    let point_positions = Arc::new(collect_point_positions(edges));
-    let original_segments = collect_unique_segments(edges);
-    let mut group_segments = Vec::with_capacity(edges.len());
-    for group in edges {
-        let mut group_set = HashSet::new();
-        for line in &group.lines {
-            let Some(original) = canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
-            else {
-                continue;
-            };
-            group_set.insert(original);
-        }
-        let mut parts = group_set.into_iter().collect::<Vec<_>>();
-        parts.sort_by_key(|segment| (segment.start, segment.end));
-        group_segments.push(parts);
-    }
-
-    build_segment_arrangement_from_parts(original_segments, point_positions, &group_segments)
+    let inputs = collect_arrangement_inputs(edges);
+    build_segment_arrangement_from_parts(
+        inputs.original_segments,
+        inputs.point_positions,
+        &inputs.group_segments,
+    )
 }
 
 fn build_segment_arrangement_from_parts(
@@ -575,6 +586,7 @@ fn build_segment_arrangement_from_parts(
         })
         .collect::<Vec<_>>();
 
+    let pair_pass_started_at = Instant::now();
     visit_candidate_pairs(&segment_bounds, 0.0, |left_index, right_index| {
         let left = original_segments[left_index];
         let right = original_segments[right_index];
@@ -594,6 +606,12 @@ fn build_segment_arrangement_from_parts(
             split_points.as_mut_slice(),
         );
     });
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_pairs", pair_pass_started_at);
+    }
+
+    log_split_point_profile(split_points.as_slice());
+    normalize_split_points(split_points.as_mut_slice());
 
     if split_points.iter().all(|points| points.is_empty()) {
         return SegmentArrangement {
@@ -603,8 +621,9 @@ fn build_segment_arrangement_from_parts(
         };
     }
 
-    let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> = HashMap::new();
-    let mut segments_set = original_segments.iter().copied().collect::<HashSet<_>>();
+    let finalize_started_at = Instant::now();
+    let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> =
+        HashMap::new();
     for (segment_index, points) in split_points.iter().enumerate() {
         if points.is_empty() {
             continue;
@@ -612,15 +631,19 @@ fn build_segment_arrangement_from_parts(
 
         let segment = original_segments[segment_index];
         let parts = split_segment(segment, Some(points.as_slice()), &point_positions);
-        segments_set.remove(&segment);
-        for part in &parts {
-            segments_set.insert(*part);
-        }
         split_segments_by_original.insert(segment, parts);
     }
 
-    let mut segments = segments_set.into_iter().collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(original_segments.len());
+    for &original in &original_segments {
+        if let Some(parts) = split_segments_by_original.get(&original) {
+            segments.extend(parts.iter().copied());
+        } else {
+            segments.push(original);
+        }
+    }
     segments.sort_by_key(|segment| (segment.start, segment.end));
+    segments.dedup();
 
     let mut group_segments = Vec::with_capacity(original_group_segments.len());
     for original_group in original_group_segments {
@@ -632,17 +655,20 @@ fn build_segment_arrangement_from_parts(
             continue;
         }
 
-        let mut group_set = HashSet::new();
+        let mut parts = Vec::with_capacity(original_group.len());
         for original in original_group {
-            if let Some(parts) = split_segments_by_original.get(original) {
-                group_set.extend(parts.iter().copied());
+            if let Some(split_parts) = split_segments_by_original.get(original) {
+                parts.extend(split_parts.iter().copied());
             } else {
-                group_set.insert(*original);
+                parts.push(*original);
             }
         }
-        let mut parts = group_set.into_iter().collect::<Vec<_>>();
         parts.sort_by_key(|segment| (segment.start, segment.end));
+        parts.dedup();
         group_segments.push(parts);
+    }
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_finalize", finalize_started_at);
     }
 
     SegmentArrangement {
@@ -650,22 +676,6 @@ fn build_segment_arrangement_from_parts(
         point_positions,
         group_segments,
     }
-}
-
-fn append_split_point_if_interior(
-    split_points: &mut Vec<QPoint>,
-    segment: CanonicalSegment,
-    point: QPoint,
-) -> bool {
-    if is_segment_endpoint(segment, point) {
-        return false;
-    }
-
-    if !split_points.contains(&point) {
-        split_points.push(point);
-        return true;
-    }
-    false
 }
 
 fn register_pair_splits(
@@ -680,13 +690,15 @@ fn register_pair_splits(
     point_positions: &mut PointPositionIndex,
     split_points: &mut [Vec<QPoint>],
 ) {
-    if segments_share_endpoint(left, right)
-        && !colinear_segments(left_start, left_end, right_start, right_end)
-    {
+    let o1 = orientation(left_start, left_end, right_start);
+    let o2 = orientation(left_start, left_end, right_end);
+    let colinear = o1.abs() <= AREA_EPSILON && o2.abs() <= AREA_EPSILON;
+
+    if segments_share_endpoint(left, right) && !colinear {
         return;
     }
 
-    if colinear_segments(left_start, left_end, right_start, right_end) {
+    if colinear {
         register_colinear_overlap_splits(
             left,
             right,
@@ -702,11 +714,29 @@ fn register_pair_splits(
         return;
     }
 
-    let Some(point) = segment_intersection_point(left_start, left_end, right_start, right_end) else {
+    let o3 = orientation(right_start, right_end, left_start);
+    let o4 = orientation(right_start, right_end, left_end);
+
+    let Some(point) = segment_intersection_point_from_orientations(
+        left_start,
+        left_end,
+        right_start,
+        right_end,
+        o1,
+        o2,
+        o3,
+        o4,
+    )
+    else {
         return;
     };
     register_split_point_for_segment(&mut split_points[left_index], point_positions, left, point);
-    register_split_point_for_segment(&mut split_points[right_index], point_positions, right, point);
+    register_split_point_for_segment(
+        &mut split_points[right_index],
+        point_positions,
+        right,
+        point,
+    );
 }
 
 fn register_colinear_overlap_splits(
@@ -723,12 +753,22 @@ fn register_colinear_overlap_splits(
 ) {
     for point in [left_start, left_end] {
         if point_on_segment(point, right_start, right_end) {
-            register_split_point_for_segment(&mut split_points[right_index], point_positions, right, point);
+            register_split_point_for_segment(
+                &mut split_points[right_index],
+                point_positions,
+                right,
+                point,
+            );
         }
     }
     for point in [right_start, right_end] {
         if point_on_segment(point, left_start, left_end) {
-            register_split_point_for_segment(&mut split_points[left_index], point_positions, left, point);
+            register_split_point_for_segment(
+                &mut split_points[left_index],
+                point_positions,
+                left,
+                point,
+            );
         }
     }
 }
@@ -740,8 +780,61 @@ fn register_split_point_for_segment(
     point: [f32; 2],
 ) {
     let quantized = quantize_point(point);
-    if append_split_point_if_interior(split_points, segment, quantized) {
-        insert_point_position(point_positions, quantized, point);
+    if is_segment_endpoint(segment, quantized) {
+        return;
+    }
+    split_points.push(quantized);
+    insert_point_position(point_positions, quantized, point);
+}
+
+fn log_split_point_profile(split_points: &[Vec<QPoint>]) {
+    if !split_profile_enabled() {
+        return;
+    }
+
+    let mut non_empty_segments = 0usize;
+    let mut raw_total = 0usize;
+    let mut unique_total = 0usize;
+    let mut duplicate_total = 0usize;
+    let mut max_raw_len = 0usize;
+
+    for points in split_points {
+        if points.is_empty() {
+            continue;
+        }
+        non_empty_segments += 1;
+        raw_total += points.len();
+        max_raw_len = max_raw_len.max(points.len());
+
+        let unique_len = if points.len() <= 1 {
+            points.len()
+        } else {
+            let mut unique_points = points.clone();
+            unique_points.sort_unstable();
+            unique_points.dedup();
+            unique_points.len()
+        };
+        unique_total += unique_len;
+        duplicate_total += points.len() - unique_len;
+    }
+
+    eprintln!(
+        "edge_drawer: split_stats segments={} raw_points={} unique_points={} duplicates={} max_points_per_segment={}",
+        non_empty_segments,
+        raw_total,
+        unique_total,
+        duplicate_total,
+        max_raw_len,
+    );
+}
+
+fn normalize_split_points(split_points: &mut [Vec<QPoint>]) {
+    for points in split_points {
+        if points.len() <= 1 {
+            continue;
+        }
+        points.sort_unstable();
+        points.dedup();
     }
 }
 
@@ -775,6 +868,7 @@ fn split_segment(
     if split_points.is_empty() {
         return vec![original];
     }
+
     if split_points.len() == 1 {
         let point = split_points[0];
         let mut segments = Vec::with_capacity(2);
@@ -788,18 +882,20 @@ fn split_segment(
     }
 
     let mut ordered = Vec::with_capacity(split_points.len() + 2);
-    ordered.push(original.start);
-    ordered.push(original.end);
-    ordered.extend(split_points.iter().copied());
-    ordered.sort_by(|lhs, rhs| {
-        segment_parameter(point_position(point_positions, *lhs), start, end)
-            .total_cmp(&segment_parameter(point_position(point_positions, *rhs), start, end))
-    });
-    ordered.dedup();
+    ordered.push((original.start, 0.0));
+    ordered.push((original.end, 1.0));
+    ordered.extend(split_points.iter().copied().map(|point| {
+        (
+            point,
+            segment_parameter(point_position(point_positions, point), start, end),
+        )
+    }));
+    ordered.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
+    ordered.dedup_by_key(|entry| entry.0);
 
     let mut segments = Vec::new();
     for window in ordered.windows(2) {
-        if let Some(segment) = canonical_segment(window[0], window[1]) {
+        if let Some(segment) = canonical_segment(window[0].0, window[1].0) {
             segments.push(segment);
         }
     }
@@ -817,9 +913,7 @@ fn segment_parameter(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
 }
 
 #[cfg(test)]
-fn classify_visible_segments(
-    edges: &[Edges],
-) -> HashSet<CanonicalSegment> {
+fn classify_visible_segments(edges: &[Edges]) -> HashSet<CanonicalSegment> {
     let arrangement = build_segment_arrangement(edges);
     if arrangement.segments.is_empty() {
         return HashSet::new();
@@ -1001,20 +1095,40 @@ fn materialize_style_buckets(
     groups
 }
 
-fn collect_unique_segments(edges: &[Edges]) -> Vec<CanonicalSegment> {
-    let mut set = HashSet::new();
+fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
+    let line_count = edges.iter().map(|group| group.lines.len()).sum::<usize>();
+    let mut point_positions = HashMap::with_capacity(line_count.saturating_mul(2));
+    let mut original_set = HashSet::with_capacity(line_count);
+    let mut group_segments = Vec::with_capacity(edges.len());
+
     for group in edges {
+        let mut group_set = HashSet::with_capacity(group.lines.len());
         for line in &group.lines {
-            if let Some(segment) =
-                canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
-            {
-                set.insert(segment);
-            }
+            let start = quantize_point(line.uv1);
+            let end = quantize_point(line.uv2);
+            point_positions.entry(start).or_insert(line.uv1);
+            point_positions.entry(end).or_insert(line.uv2);
+
+            let Some(segment) = canonical_segment(start, end) else {
+                continue;
+            };
+            original_set.insert(segment);
+            group_set.insert(segment);
         }
+
+        let mut parts = group_set.into_iter().collect::<Vec<_>>();
+        parts.sort_by_key(|segment| (segment.start, segment.end));
+        group_segments.push(parts);
     }
-    let mut segments = set.into_iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| (segment.start, segment.end));
-    segments
+
+    let mut original_segments = original_set.into_iter().collect::<Vec<_>>();
+    original_segments.sort_by_key(|segment| (segment.start, segment.end));
+
+    ArrangementInputs {
+        point_positions: Arc::new(point_positions),
+        original_segments,
+        group_segments,
+    }
 }
 
 fn default_grid_resolution(count: usize) -> u32 {
@@ -1024,6 +1138,15 @@ fn default_grid_resolution(count: usize) -> u32 {
 
     let target = (count as f32).sqrt().ceil() as u32;
     target.next_power_of_two().clamp(16, 256)
+}
+
+fn default_candidate_pair_grid_resolution(count: usize) -> u32 {
+    if count <= 1 {
+        return 32;
+    }
+
+    let target = ((count as f32).sqrt().ceil() as u32).saturating_mul(2);
+    target.next_power_of_two().clamp(32, 512)
 }
 
 fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2]) {
@@ -1059,7 +1182,6 @@ fn build_dense_grid(bounds: &[SegmentBounds], expand: f32, resolution: u32) -> D
     ];
     let cell_count = (resolution as usize) * (resolution as usize);
     let mut counts = vec![0usize; cell_count];
-
     for bounds in bounds.iter() {
         let min_x = cell_coord(bounds.min[0] - expand, min[0], cell_size[0], resolution);
         let max_x = cell_coord(bounds.max[0] + expand, min[0], cell_size[0], resolution);
@@ -1105,6 +1227,58 @@ fn build_dense_grid(bounds: &[SegmentBounds], expand: f32, resolution: u32) -> D
     }
 }
 
+fn build_arrangement_grid(
+    bounds: &[SegmentBounds],
+    expand: f32,
+    resolution: u32,
+) -> ArrangementGridIndex {
+    let dense = build_dense_grid(bounds, expand, resolution);
+    let mut segment_cell_starts = Vec::with_capacity(bounds.len() + 1);
+    let mut segment_cells = Vec::new();
+    segment_cell_starts.push(0);
+
+    for bounds in bounds.iter() {
+        let min_x = cell_coord(
+            bounds.min[0] - expand,
+            dense.min[0],
+            dense.cell_size[0],
+            dense.resolution,
+        );
+        let max_x = cell_coord(
+            bounds.max[0] + expand,
+            dense.min[0],
+            dense.cell_size[0],
+            dense.resolution,
+        );
+        let min_y = cell_coord(
+            bounds.min[1] - expand,
+            dense.min[1],
+            dense.cell_size[1],
+            dense.resolution,
+        );
+        let max_y = cell_coord(
+            bounds.max[1] + expand,
+            dense.min[1],
+            dense.cell_size[1],
+            dense.resolution,
+        );
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                segment_cells.push(dense_cell_index(x, y, dense.resolution));
+            }
+        }
+
+        segment_cell_starts.push(segment_cells.len());
+    }
+
+    ArrangementGridIndex {
+        dense,
+        segment_cell_starts,
+        segment_cells,
+    }
+}
+
 fn visit_candidate_pairs<F>(bounds: &[SegmentBounds], expand: f32, mut visitor: F)
 where
     F: FnMut(usize, usize),
@@ -1113,29 +1287,75 @@ where
         return;
     }
 
-    let mut sorted_indices = (0..bounds.len()).collect::<Vec<_>>();
-    sorted_indices.sort_by(|lhs, rhs| {
-        bounds[*lhs].min[0]
-            .total_cmp(&bounds[*rhs].min[0])
-            .then_with(|| bounds[*lhs].max[0].total_cmp(&bounds[*rhs].max[0]))
-    });
+    let grid = build_arrangement_grid(
+        bounds,
+        expand,
+        default_candidate_pair_grid_resolution(bounds.len()),
+    );
+    let mut visited_marks = vec![0u32; bounds.len()];
+    let mut current_mark = 1u32;
+    let pair_profile = pair_profile_enabled();
+    let mut segment_cell_visits = 0usize;
+    let mut dense_candidates = 0usize;
+    let mut duplicate_candidates = 0usize;
+    let mut ordered_pair_candidates = 0usize;
+    let mut overlap_candidates = 0usize;
 
-    let mut active = Vec::<usize>::new();
-    for &current in &sorted_indices {
-        let current_min_x = bounds[current].min[0] - expand;
-        active.retain(|idx| bounds[*idx].max[0] + expand >= current_min_x);
+    for current in 0..bounds.len() {
+        if current_mark == u32::MAX {
+            visited_marks.fill(0);
+            current_mark = 1;
+        }
 
-        for &candidate in &active {
-            if bounds_overlap(bounds[current], bounds[candidate], expand) {
-                if candidate < current {
-                    visitor(candidate, current);
-                } else {
+        let current_bounds = bounds[current];
+        let cell_start = grid.segment_cell_starts[current];
+        let cell_end = grid.segment_cell_starts[current + 1];
+        if pair_profile {
+            segment_cell_visits += cell_end - cell_start;
+        }
+
+        for &cell_index in &grid.segment_cells[cell_start..cell_end] {
+            let start = grid.dense.cell_starts[cell_index];
+            let end = grid.dense.cell_starts[cell_index + 1];
+            let candidates = &grid.dense.indices[start..end];
+            let first_higher = candidates.partition_point(|&candidate| candidate <= current);
+
+            for &candidate in &candidates[first_higher..] {
+                if pair_profile {
+                    dense_candidates += 1;
+                }
+                if pair_profile {
+                    ordered_pair_candidates += 1;
+                }
+                if visited_marks[candidate] == current_mark {
+                    if pair_profile {
+                        duplicate_candidates += 1;
+                    }
+                    continue;
+                }
+                visited_marks[candidate] = current_mark;
+
+                if bounds_overlap(current_bounds, bounds[candidate], expand) {
+                    if pair_profile {
+                        overlap_candidates += 1;
+                    }
                     visitor(current, candidate);
                 }
             }
         }
 
-        active.push(current);
+        current_mark += 1;
+    }
+
+    if pair_profile {
+        eprintln!(
+            "edge_drawer: pair_stats cells={} dense_candidates={} ordered_candidates={} duplicates={} overlaps={}",
+            segment_cell_visits,
+            dense_candidates,
+            ordered_pair_candidates,
+            duplicate_candidates,
+            overlap_candidates,
+        );
     }
 }
 
@@ -1178,22 +1398,35 @@ fn build_canvas_grid(
     let resolution = default_grid_resolution(segments.len());
     let width_f = width.max(1) as f32;
     let height_f = height.max(1) as f32;
-    let cell_size = [
-        width_f / resolution as f32,
-        height_f / resolution as f32,
-    ];
+    let cell_size = [width_f / resolution as f32, height_f / resolution as f32];
     let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
 
     for (idx, segment) in segments.iter().enumerate() {
         let bounds = segment_bounds_canvas(*segment, width, height);
-        let min_x =
-            cell_coord((bounds.min[0] - expand_pixels).max(0.0), 0.0, cell_size[0], resolution);
-        let max_x =
-            cell_coord((bounds.max[0] + expand_pixels).min(width_f), 0.0, cell_size[0], resolution);
-        let min_y =
-            cell_coord((bounds.min[1] - expand_pixels).max(0.0), 0.0, cell_size[1], resolution);
-        let max_y =
-            cell_coord((bounds.max[1] + expand_pixels).min(height_f), 0.0, cell_size[1], resolution);
+        let min_x = cell_coord(
+            (bounds.min[0] - expand_pixels).max(0.0),
+            0.0,
+            cell_size[0],
+            resolution,
+        );
+        let max_x = cell_coord(
+            (bounds.max[0] + expand_pixels).min(width_f),
+            0.0,
+            cell_size[0],
+            resolution,
+        );
+        let min_y = cell_coord(
+            (bounds.min[1] - expand_pixels).max(0.0),
+            0.0,
+            cell_size[1],
+            resolution,
+        );
+        let max_y = cell_coord(
+            (bounds.max[1] + expand_pixels).min(height_f),
+            0.0,
+            cell_size[1],
+            resolution,
+        );
 
         for x in min_x..=max_x {
             for y in min_y..=max_y {
@@ -1202,9 +1435,7 @@ fn build_canvas_grid(
         }
     }
 
-    UniformGridIndex {
-        cells,
-    }
+    UniformGridIndex { cells }
 }
 
 fn detect_padding_warning_segments(
@@ -1244,7 +1475,12 @@ fn detect_padding_warning_segments(
 
     let segment_component_ids = outline_segments
         .iter()
-        .map(|segment| outline_components.get(&segment.start).copied().unwrap_or_default())
+        .map(|segment| {
+            outline_components
+                .get(&segment.start)
+                .copied()
+                .unwrap_or_default()
+        })
         .collect::<Vec<_>>();
     let canvas_grid = build_canvas_grid(
         &outline_segments,
@@ -1285,11 +1521,7 @@ fn detect_padding_warning_segments(
     warning_segments
 }
 
-fn segment_border_distance_pixels(
-    segment: CanonicalSegment,
-    width: u32,
-    height: u32,
-) -> f32 {
+fn segment_border_distance_pixels(segment: CanonicalSegment, width: u32, height: u32) -> f32 {
     let a = to_canvas_point(segment.start, width, height);
     let b = to_canvas_point(segment.end, width, height);
     let min_x = a[0].min(b[0]);
@@ -1299,7 +1531,8 @@ fn segment_border_distance_pixels(
     let width = width as f32;
     let height = height as f32;
 
-    min_x.min((width - max_x).max(0.0))
+    min_x
+        .min((width - max_x).max(0.0))
         .min(min_y)
         .min((height - max_y).max(0.0))
 }
@@ -1348,6 +1581,20 @@ fn segments_intersect(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) ->
     let o3 = orientation(b0, b1, a0);
     let o4 = orientation(b0, b1, a1);
 
+    segments_intersect_from_orientations(a0, a1, b0, b1, o1, o2, o3, o4)
+}
+
+fn segments_intersect_from_orientations(
+    a0: [f32; 2],
+    a1: [f32; 2],
+    b0: [f32; 2],
+    b1: [f32; 2],
+    o1: f32,
+    o2: f32,
+    o3: f32,
+    o4: f32,
+) -> bool {
+
     if o1.abs() <= AREA_EPSILON && on_segment(a0, b0, a1) {
         return true;
     }
@@ -1375,26 +1622,25 @@ fn on_segment(start: [f32; 2], point: [f32; 2], end: [f32; 2]) -> bool {
         && point[1] <= start[1].max(end[1]) + AREA_EPSILON
 }
 
-fn colinear_segments(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> bool {
-    orientation(a0, a1, b0).abs() <= AREA_EPSILON && orientation(a0, a1, b1).abs() <= AREA_EPSILON
-}
-
 fn point_on_segment(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> bool {
     orientation(start, end, point).abs() <= AREA_EPSILON && on_segment(start, point, end)
 }
 
-fn segment_intersection_point(
+fn segment_intersection_point_from_orientations(
     a0: [f32; 2],
     a1: [f32; 2],
     b0: [f32; 2],
     b1: [f32; 2],
+    o1: f32,
+    o2: f32,
+    o3: f32,
+    o4: f32,
 ) -> Option<[f32; 2]> {
-    if !segments_intersect(a0, a1, b0, b1) {
+    if !segments_intersect_from_orientations(a0, a1, b0, b1, o1, o2, o3, o4) {
         return None;
     }
 
-    let denominator =
-        (a0[0] - a1[0]) * (b0[1] - b1[1]) - (a0[1] - a1[1]) * (b0[0] - b1[0]);
+    let denominator = (a0[0] - a1[0]) * (b0[1] - b1[1]) - (a0[1] - a1[1]) * (b0[0] - b1[0]);
     if denominator.abs() <= AREA_EPSILON {
         for point in [a0, a1, b0, b1] {
             if point_on_segment(point, a0, a1) && point_on_segment(point, b0, b1) {
@@ -1427,13 +1673,12 @@ fn classify_segments(
     let mut outline_segments = HashSet::new();
 
     for &segment in unique_segments {
-        let (left_inside, right_inside) =
-            segment_side_states_with_polygons(
-                segment,
-                &polygon_index,
-                point_positions,
-                &mut sample_cache,
-            );
+        let (left_inside, right_inside) = segment_side_states_with_polygons(
+            segment,
+            &polygon_index,
+            point_positions,
+            &mut sample_cache,
+        );
         match (left_inside, right_inside) {
             (true, true) => {
                 internal_segments.insert(segment);
@@ -1464,7 +1709,10 @@ fn classify_segments_from_graph(
     let mut outline_segments = HashSet::new();
 
     for &segment in unique_segments {
-        let component_id = component_map.get(&segment.start).copied().unwrap_or_default();
+        let component_id = component_map
+            .get(&segment.start)
+            .copied()
+            .unwrap_or_default();
         if !components_with_faces.contains(&component_id) {
             outline_segments.insert(segment);
             continue;
@@ -1725,7 +1973,7 @@ fn point_in_faces(
     inside
 }
 
-fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
+fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex<'_> {
     let indexed_polygons = polygons
         .iter()
         .map(|polygon| {
@@ -1738,7 +1986,7 @@ fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
                 max[1] = max[1].max(point[1]);
             }
             IndexedPolygon {
-                points: polygon.points.clone(),
+                points: polygon.points.as_slice(),
                 bounds: SegmentBounds { min, max },
             }
         })
@@ -1763,7 +2011,7 @@ fn sample_point_key(point: [f32; 2]) -> SamplePointKey {
 
 fn point_in_polygons(
     point: [f32; 2],
-    polygon_index: &PolygonIndex,
+    polygon_index: &PolygonIndex<'_>,
     sample_cache: &mut HashMap<SamplePointKey, bool>,
 ) -> bool {
     let key = sample_point_key(point);
@@ -2318,6 +2566,85 @@ fn compact_payload_from_buffers(
     })
 }
 
+fn build_polygon_buffers_from_indexed_uvs(
+    face_uv_counts: &[usize],
+    face_uv_ids: &[usize],
+    all_us: &[f32],
+    all_vs: &[f32],
+) -> Result<(Vec<usize>, Vec<f32>), BoxError> {
+    if all_us.len() != all_vs.len() {
+        return Err("UV coordinate arrays must have the same length".into());
+    }
+    if face_uv_counts.is_empty() {
+        return Ok((vec![0], Vec::new()));
+    }
+
+    let mut polygon_offsets = Vec::with_capacity(face_uv_counts.len() + 1);
+    let mut polygon_points = Vec::with_capacity(face_uv_ids.len() * 2);
+    polygon_offsets.push(0);
+
+    let uv_len = all_us.len();
+    let mut uv_index = 0usize;
+    let mut point_count = 0usize;
+    for &face_uv_count in face_uv_counts {
+        if face_uv_count == 0 {
+            continue;
+        }
+
+        let next_uv_index = uv_index + face_uv_count;
+        if next_uv_index > face_uv_ids.len() {
+            return Err("face_uv_counts exceed face_uv_ids length".into());
+        }
+        let face_uv_ids = &face_uv_ids[uv_index..next_uv_index];
+
+        let start_len = polygon_points.len();
+        let mut deduped_point_count = 0usize;
+        let mut first_u = 0.0f32;
+        let mut first_v = 0.0f32;
+        let mut previous_u = 0.0f32;
+        let mut previous_v = 0.0f32;
+        let mut has_previous = false;
+
+        for &uv_id in face_uv_ids {
+            if uv_id >= uv_len {
+                return Err("face_uv_ids contain an out-of-range UV index".into());
+            }
+            let u = unsafe { *all_us.get_unchecked(uv_id) };
+            let v = unsafe { *all_vs.get_unchecked(uv_id) };
+
+            if has_previous && previous_u == u && previous_v == v {
+                continue;
+            }
+            if deduped_point_count == 0 {
+                first_u = u;
+                first_v = v;
+            }
+            polygon_points.push(u);
+            polygon_points.push(v);
+            previous_u = u;
+            previous_v = v;
+            has_previous = true;
+            deduped_point_count += 1;
+        }
+
+        if deduped_point_count >= 3 && previous_u == first_u && previous_v == first_v {
+            polygon_points.truncate(polygon_points.len() - 2);
+            deduped_point_count -= 1;
+        }
+
+        if deduped_point_count < 3 {
+            polygon_points.truncate(start_len);
+        } else {
+            point_count += deduped_point_count;
+            polygon_offsets.push(point_count);
+        }
+
+        uv_index = next_uv_index;
+    }
+
+    Ok((polygon_offsets, polygon_points))
+}
+
 #[pyfunction(name = "draw_edges")]
 fn draw_edges_py(image_path: &str, width: u32, height: u32, edges_json: &str) -> PyResult<()> {
     draw_to_path(Path::new(image_path), width, height, edges_json)
@@ -2382,10 +2709,22 @@ fn draw_edges_buffered_py(
     }
 }
 
+#[pyfunction(name = "build_polygon_buffers")]
+fn build_polygon_buffers_py(
+    face_uv_counts: Vec<usize>,
+    face_uv_ids: Vec<usize>,
+    all_us: Vec<f32>,
+    all_vs: Vec<f32>,
+) -> PyResult<(Vec<usize>, Vec<f32>)> {
+    build_polygon_buffers_from_indexed_uvs(&face_uv_counts, &face_uv_ids, &all_us, &all_vs)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+}
+
 #[pymodule(name = "_edge_drawer")]
 fn _edge_drawer(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(draw_edges_py, module)?)?;
     module.add_function(wrap_pyfunction!(draw_edges_buffered_py, module)?)?;
+    module.add_function(wrap_pyfunction!(build_polygon_buffers_py, module)?)?;
     Ok(())
 }
 
@@ -2587,6 +2926,34 @@ mod tests {
     }
 
     #[test]
+    fn build_polygon_buffers_dedupes_consecutive_points_and_closing_duplicate() {
+        let (offsets, points) = build_polygon_buffers_from_indexed_uvs(
+            &[5],
+            &[0, 1, 1, 2, 0],
+            &[0.0, 1.0, 1.0],
+            &[0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        assert_eq!(offsets, vec![0, 3]);
+        assert_eq!(points, vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn build_polygon_buffers_discards_degenerate_faces() {
+        let (offsets, points) = build_polygon_buffers_from_indexed_uvs(
+            &[2, 3],
+            &[0, 1, 0, 1, 2],
+            &[0.0, 1.0, 1.0],
+            &[0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        assert_eq!(offsets, vec![0, 3]);
+        assert_eq!(points, vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
     fn test_parse_edges_json_valid_data() {
         let edges = parse_edges_json(VALID_JSON).unwrap();
         assert_eq!(edges.len(), 1);
@@ -2754,11 +3121,21 @@ mod tests {
     fn test_offset_rectangles_split_overlap_into_union_outline() {
         let edges = parse_edges_json(&offset_rectangles_json()).unwrap();
         let visible = classify_visible_segments(&edges);
-        assert!(visible.contains(&canonical_segment(quantize_point([0.1, 0.2]), quantize_point([0.3, 0.2])).unwrap()));
-        assert!(visible.contains(&canonical_segment(quantize_point([0.3, 0.2]), quantize_point([0.5, 0.2])).unwrap()));
-        assert!(visible.contains(&canonical_segment(quantize_point([0.5, 0.2]), quantize_point([0.7, 0.2])).unwrap()));
-        assert!(!visible.contains(&canonical_segment(quantize_point([0.3, 0.2]), quantize_point([0.3, 0.8])).unwrap()));
-        assert!(!visible.contains(&canonical_segment(quantize_point([0.5, 0.2]), quantize_point([0.5, 0.8])).unwrap()));
+        assert!(visible.contains(
+            &canonical_segment(quantize_point([0.1, 0.2]), quantize_point([0.3, 0.2])).unwrap()
+        ));
+        assert!(visible.contains(
+            &canonical_segment(quantize_point([0.3, 0.2]), quantize_point([0.5, 0.2])).unwrap()
+        ));
+        assert!(visible.contains(
+            &canonical_segment(quantize_point([0.5, 0.2]), quantize_point([0.7, 0.2])).unwrap()
+        ));
+        assert!(!visible.contains(
+            &canonical_segment(quantize_point([0.3, 0.2]), quantize_point([0.3, 0.8])).unwrap()
+        ));
+        assert!(!visible.contains(
+            &canonical_segment(quantize_point([0.5, 0.2]), quantize_point([0.5, 0.8])).unwrap()
+        ));
     }
 
     #[test]
@@ -2766,8 +3143,16 @@ mod tests {
         let polygons = overlapping_polygons();
         let polygon_index = build_polygon_index(&polygons);
         let mut sample_cache = HashMap::new();
-        assert!(point_in_polygons([0.5, 0.5], &polygon_index, &mut sample_cache));
-        assert!(!point_in_polygons([0.95, 0.95], &polygon_index, &mut sample_cache));
+        assert!(point_in_polygons(
+            [0.5, 0.5],
+            &polygon_index,
+            &mut sample_cache
+        ));
+        assert!(!point_in_polygons(
+            [0.95, 0.95],
+            &polygon_index,
+            &mut sample_cache
+        ));
         assert_eq!(
             point_in_polygons_bruteforce([0.5, 0.5], &polygons),
             point_in_polygons([0.5, 0.5], &polygon_index, &mut sample_cache)
@@ -2788,21 +3173,29 @@ mod tests {
 
         let paths = build_paths_from_segments(&segments);
         assert_eq!(paths.len(), 3);
-        assert!(paths.iter().any(|path| path == &vec![a, b] || path == &vec![b, a]));
-        assert!(paths.iter().any(|path| path == &vec![b, c] || path == &vec![c, b]));
-        assert!(paths.iter().any(|path| path == &vec![b, d] || path == &vec![d, b]));
+        assert!(paths
+            .iter()
+            .any(|path| path == &vec![a, b] || path == &vec![b, a]));
+        assert!(paths
+            .iter()
+            .any(|path| path == &vec![b, c] || path == &vec![c, b]));
+        assert!(paths
+            .iter()
+            .any(|path| path == &vec![b, d] || path == &vec![d, b]));
     }
 
-    fn arrangement_from_segments(
-        segments: &[([f32; 2], [f32; 2])],
-    ) -> SegmentArrangement {
+    fn arrangement_from_segments(segments: &[([f32; 2], [f32; 2])]) -> SegmentArrangement {
         let original_segments = segments
             .iter()
-            .map(|(start, end)| canonical_segment(quantize_point(*start), quantize_point(*end)).unwrap())
+            .map(|(start, end)| {
+                canonical_segment(quantize_point(*start), quantize_point(*end)).unwrap()
+            })
             .collect::<Vec<_>>();
         let mut point_positions = HashMap::new();
         for (start, end) in segments {
-            point_positions.entry(quantize_point(*start)).or_insert(*start);
+            point_positions
+                .entry(quantize_point(*start))
+                .or_insert(*start);
             point_positions.entry(quantize_point(*end)).or_insert(*end);
         }
         let group_segments = vec![original_segments.clone()];
@@ -2815,10 +3208,8 @@ mod tests {
 
     #[test]
     fn test_arrangement_shared_endpoint_does_not_split() {
-        let arrangement = arrangement_from_segments(&[
-            ([0.0, 0.0], [1.0, 0.0]),
-            ([1.0, 0.0], [1.0, 1.0]),
-        ]);
+        let arrangement =
+            arrangement_from_segments(&[([0.0, 0.0], [1.0, 0.0]), ([1.0, 0.0], [1.0, 1.0])]);
         assert_eq!(arrangement.segments.len(), 2);
         assert_eq!(arrangement.group_segments.len(), 1);
         assert_eq!(arrangement.group_segments[0].len(), 2);
@@ -2826,79 +3217,61 @@ mod tests {
 
     #[test]
     fn test_arrangement_t_junction_splits_only_trunk() {
-        let arrangement = arrangement_from_segments(&[
-            ([0.0, 0.0], [1.0, 0.0]),
-            ([0.5, 0.0], [0.5, 1.0]),
-        ]);
+        let arrangement =
+            arrangement_from_segments(&[([0.0, 0.0], [1.0, 0.0]), ([0.5, 0.0], [0.5, 1.0])]);
         assert_eq!(arrangement.segments.len(), 3);
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.0, 0.0]),
-            quantize_point([0.5, 0.0]),
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.5, 0.0]),
-            quantize_point([1.0, 0.0]),
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.5, 0.0]),
-            quantize_point([0.5, 1.0]),
-        ).unwrap()));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([0.0, 0.0]), quantize_point([0.5, 0.0]),).unwrap()
+        ));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([0.5, 0.0]), quantize_point([1.0, 0.0]),).unwrap()
+        ));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([0.5, 0.0]), quantize_point([0.5, 1.0]),).unwrap()
+        ));
     }
 
     #[test]
     fn test_arrangement_crossing_splits_both_segments() {
-        let arrangement = arrangement_from_segments(&[
-            ([0.0, 0.0], [1.0, 1.0]),
-            ([0.0, 1.0], [1.0, 0.0]),
-        ]);
+        let arrangement =
+            arrangement_from_segments(&[([0.0, 0.0], [1.0, 1.0]), ([0.0, 1.0], [1.0, 0.0])]);
         assert_eq!(arrangement.segments.len(), 4);
         let center = quantize_point([0.5, 0.5]);
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.0, 0.0]),
-            center,
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            center,
-            quantize_point([1.0, 1.0]),
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.0, 1.0]),
-            center,
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            center,
-            quantize_point([1.0, 0.0]),
-        ).unwrap()));
+        assert!(arrangement
+            .segments
+            .contains(&canonical_segment(quantize_point([0.0, 0.0]), center,).unwrap()));
+        assert!(arrangement
+            .segments
+            .contains(&canonical_segment(center, quantize_point([1.0, 1.0]),).unwrap()));
+        assert!(arrangement
+            .segments
+            .contains(&canonical_segment(quantize_point([0.0, 1.0]), center,).unwrap()));
+        assert!(arrangement
+            .segments
+            .contains(&canonical_segment(center, quantize_point([1.0, 0.0]),).unwrap()));
     }
 
     #[test]
     fn test_arrangement_colinear_endpoint_touch_does_not_split() {
-        let arrangement = arrangement_from_segments(&[
-            ([0.0, 0.0], [1.0, 0.0]),
-            ([1.0, 0.0], [2.0, 0.0]),
-        ]);
+        let arrangement =
+            arrangement_from_segments(&[([0.0, 0.0], [1.0, 0.0]), ([1.0, 0.0], [2.0, 0.0])]);
         assert_eq!(arrangement.segments.len(), 2);
     }
 
     #[test]
     fn test_arrangement_colinear_overlap_splits_internal_boundaries_only() {
-        let arrangement = arrangement_from_segments(&[
-            ([0.0, 0.0], [2.0, 0.0]),
-            ([1.0, 0.0], [3.0, 0.0]),
-        ]);
+        let arrangement =
+            arrangement_from_segments(&[([0.0, 0.0], [2.0, 0.0]), ([1.0, 0.0], [3.0, 0.0])]);
         assert_eq!(arrangement.segments.len(), 3);
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([0.0, 0.0]),
-            quantize_point([1.0, 0.0]),
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([1.0, 0.0]),
-            quantize_point([2.0, 0.0]),
-        ).unwrap()));
-        assert!(arrangement.segments.contains(&canonical_segment(
-            quantize_point([2.0, 0.0]),
-            quantize_point([3.0, 0.0]),
-        ).unwrap()));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([0.0, 0.0]), quantize_point([1.0, 0.0]),).unwrap()
+        ));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([1.0, 0.0]), quantize_point([2.0, 0.0]),).unwrap()
+        ));
+        assert!(arrangement.segments.contains(
+            &canonical_segment(quantize_point([2.0, 0.0]), quantize_point([3.0, 0.0]),).unwrap()
+        ));
     }
 
     #[test]
