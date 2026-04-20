@@ -1119,7 +1119,9 @@ fn materialize_style_buckets(
 }
 
 fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
+    let detail_profile = arrangement_detail_profile_enabled();
     let line_count = edges.iter().map(|group| group.lines.len()).sum::<usize>();
+    let collect_segments_started_at = Instant::now();
     let mut point_positions = HashMap::with_capacity(line_count.saturating_mul(2));
     let mut original_segments = Vec::with_capacity(line_count);
     let mut group_segments = Vec::with_capacity(edges.len());
@@ -1143,10 +1145,25 @@ fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
         parts.dedup();
         group_segments.push(parts);
     }
+    if detail_profile {
+        log_profile("arrangement_collect_segments", collect_segments_started_at);
+    }
 
+    let sort_original_started_at = Instant::now();
     original_segments.sort_unstable_by_key(|segment| (segment.start, segment.end));
     original_segments.dedup();
+    if detail_profile {
+        log_profile("arrangement_collect_original_dedup", sort_original_started_at);
+    }
+
+    let materialize_group_indices_started_at = Instant::now();
     let group_segment_indices = build_group_segment_indices(&original_segments, &group_segments);
+    if detail_profile {
+        log_profile(
+            "arrangement_collect_group_indices",
+            materialize_group_indices_started_at,
+        );
+    }
 
     ArrangementInputs {
         point_positions: Arc::new(point_positions),
@@ -1160,18 +1177,27 @@ fn build_group_segment_indices(
     original_segments: &[CanonicalSegment],
     group_segments: &[Vec<CanonicalSegment>],
 ) -> Vec<Vec<usize>> {
-    let segment_indices = original_segments
-        .iter()
-        .enumerate()
-        .map(|(index, &segment)| (segment, index))
-        .collect::<HashMap<_, _>>();
-
     group_segments
         .iter()
         .map(|group| {
-            group.iter()
-                .map(|segment| segment_indices[segment])
-                .collect::<Vec<_>>()
+            let mut cursor = 0usize;
+            let mut indices = Vec::with_capacity(group.len());
+
+            for &segment in group {
+                let target = (segment.start, segment.end);
+                while cursor < original_segments.len()
+                    && (original_segments[cursor].start, original_segments[cursor].end) < target
+                {
+                    cursor += 1;
+                }
+                assert!(
+                    cursor < original_segments.len() && original_segments[cursor] == segment,
+                    "group segment must exist in original segments",
+                );
+                indices.push(cursor);
+            }
+
+            indices
         })
         .collect()
 }
