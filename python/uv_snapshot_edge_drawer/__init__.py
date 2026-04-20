@@ -1243,7 +1243,7 @@ def execute_drawer(image_path, width, height, payload_data, open_after_save=True
 
     image_path = render_payload_to_path(image_path, width, height, payload_data)
     if open_after_save:
-        subprocess.call("start " + image_path, shell=True)
+        os.startfile(image_path)
 
 
 def _normalize_output_path(image_path):
