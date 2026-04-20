@@ -705,7 +705,10 @@ fn build_segment_arrangement_from_parts(
         group_segments.push(parts);
     }
     if detail_profile {
-        log_profile("arrangement_finalize_group_rebuild", rebuild_groups_started_at);
+        log_profile(
+            "arrangement_finalize_group_rebuild",
+            rebuild_groups_started_at,
+        );
         log_profile("arrangement_finalize", finalize_started_at);
     }
 
@@ -731,8 +734,8 @@ fn register_pair_splits(
     let o1 = orientation(left_start, left_end, right_start);
     let o2 = orientation(left_start, left_end, right_end);
     let colinear = o1.abs() <= AREA_EPSILON && o2.abs() <= AREA_EPSILON;
-    let left_straddles_right = (o1 > AREA_EPSILON && o2 < -AREA_EPSILON)
-        || (o1 < -AREA_EPSILON && o2 > AREA_EPSILON);
+    let left_straddles_right =
+        (o1 > AREA_EPSILON && o2 < -AREA_EPSILON) || (o1 < -AREA_EPSILON && o2 > AREA_EPSILON);
 
     if segments_share_endpoint(left, right) && !colinear {
         return;
@@ -770,8 +773,7 @@ fn register_pair_splits(
         o2,
         o3,
         o4,
-    )
-    else {
+    ) else {
         return;
     };
     register_split_point_for_segment(&mut split_points[left_index], point_positions, left, point);
@@ -1166,7 +1168,10 @@ fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
     original_segments.sort_unstable_by_key(|segment| (segment.start, segment.end));
     original_segments.dedup();
     if detail_profile {
-        log_profile("arrangement_collect_original_dedup", sort_original_started_at);
+        log_profile(
+            "arrangement_collect_original_dedup",
+            sort_original_started_at,
+        );
     }
 
     let materialize_group_indices_started_at = Instant::now();
@@ -1199,7 +1204,10 @@ fn build_group_segment_indices(
             for &segment in group {
                 let target = (segment.start, segment.end);
                 while cursor < original_segments.len()
-                    && (original_segments[cursor].start, original_segments[cursor].end) < target
+                    && (
+                        original_segments[cursor].start,
+                        original_segments[cursor].end,
+                    ) < target
                 {
                     cursor += 1;
                 }
@@ -1688,7 +1696,6 @@ fn segments_intersect_from_orientations(
     o3: f32,
     o4: f32,
 ) -> bool {
-
     if o1.abs() <= AREA_EPSILON && on_segment(a0, b0, a1) {
         return true;
     }
