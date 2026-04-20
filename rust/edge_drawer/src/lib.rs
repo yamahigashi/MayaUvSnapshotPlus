@@ -1233,6 +1233,18 @@ fn default_candidate_pair_grid_resolution(count: usize) -> u32 {
     target.next_power_of_two().clamp(32, 256)
 }
 
+fn candidate_pair_grid_resolution(count: usize) -> u32 {
+    if let Ok(value) = std::env::var("EDGE_DRAWER_PAIR_GRID_RESOLUTION") {
+        if let Ok(parsed) = value.parse::<u32>() {
+            if parsed >= 1 {
+                return parsed.next_power_of_two().clamp(32, 1024);
+            }
+        }
+    }
+
+    default_candidate_pair_grid_resolution(count)
+}
+
 fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2]) {
     let mut min = [f32::INFINITY, f32::INFINITY];
     let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
@@ -1371,11 +1383,8 @@ where
         return;
     }
 
-    let grid = build_arrangement_grid(
-        bounds,
-        expand,
-        default_candidate_pair_grid_resolution(bounds.len()),
-    );
+    let resolution = candidate_pair_grid_resolution(bounds.len());
+    let grid = build_arrangement_grid(bounds, expand, resolution);
     let mut visited_marks = vec![0u32; bounds.len()];
     let mut current_mark = 1u32;
     let pair_profile = pair_profile_enabled();
@@ -1433,7 +1442,8 @@ where
 
     if pair_profile {
         eprintln!(
-            "edge_drawer: pair_stats cells={} dense_candidates={} ordered_candidates={} duplicates={} overlaps={}",
+            "edge_drawer: pair_stats resolution={} cells={} dense_candidates={} ordered_candidates={} duplicates={} overlaps={}",
+            resolution,
             segment_cell_visits,
             dense_candidates,
             ordered_pair_candidates,
@@ -1848,15 +1858,119 @@ fn segment_side_states_with_polygons(
     let right = [mid[0] - offset[0], mid[1] - offset[1]];
 
     if let Some(stats) = stats {
-        let left_inside = point_in_polygons(left, polygon_index, Some(&mut *stats));
-        let right_inside = point_in_polygons(right, polygon_index, Some(&mut *stats));
-        (left_inside, right_inside)
+        segment_side_states_with_shared_candidates(left, right, polygon_index, stats)
     } else {
-        (
-            point_in_polygons(left, polygon_index, None),
-            point_in_polygons(right, polygon_index, None),
-        )
+        segment_side_states_with_shared_candidates_no_stats(left, right, polygon_index)
     }
+}
+
+fn segment_side_states_with_shared_candidates(
+    left: [f32; 2],
+    right: [f32; 2],
+    polygon_index: &PolygonIndex<'_>,
+    stats: &mut ClassificationStats,
+) -> (bool, bool) {
+    stats.sample_queries += 2;
+
+    let left_cell = dense_grid_cell_index_for_point(&polygon_index.grid, left);
+    let right_cell = dense_grid_cell_index_for_point(&polygon_index.grid, right);
+    if left_cell != right_cell {
+        let left_inside = point_in_polygons_from_candidates(
+            left,
+            polygon_index,
+            dense_grid_candidates_for_cell(&polygon_index.grid, left_cell),
+            Some(&mut *stats),
+        );
+        let right_inside = point_in_polygons_from_candidates(
+            right,
+            polygon_index,
+            dense_grid_candidates_for_cell(&polygon_index.grid, right_cell),
+            Some(stats),
+        );
+        return (left_inside, right_inside);
+    }
+
+    let candidates = dense_grid_candidates_for_cell(&polygon_index.grid, left_cell);
+    stats.candidate_polygons += candidates.len() * 2;
+
+    let mut left_inside = false;
+    let mut right_inside = false;
+    for &polygon_index_id in candidates {
+        if left_inside && right_inside {
+            break;
+        }
+
+        let polygon = &polygon_index.polygons[polygon_index_id];
+        if !left_inside {
+            stats.bounds_checks += 1;
+            if bounds_contains_point(polygon.bounds, left) {
+                stats.point_in_polygon_tests += 1;
+                if point_in_polygon_points(left, &polygon.points) {
+                    left_inside = true;
+                }
+            }
+        }
+        if !right_inside {
+            stats.bounds_checks += 1;
+            if bounds_contains_point(polygon.bounds, right) {
+                stats.point_in_polygon_tests += 1;
+                if point_in_polygon_points(right, &polygon.points) {
+                    right_inside = true;
+                }
+            }
+        }
+    }
+
+    (left_inside, right_inside)
+}
+
+fn segment_side_states_with_shared_candidates_no_stats(
+    left: [f32; 2],
+    right: [f32; 2],
+    polygon_index: &PolygonIndex<'_>,
+) -> (bool, bool) {
+    let left_cell = dense_grid_cell_index_for_point(&polygon_index.grid, left);
+    let right_cell = dense_grid_cell_index_for_point(&polygon_index.grid, right);
+    if left_cell != right_cell {
+        let left_inside = point_in_polygons_from_candidates(
+            left,
+            polygon_index,
+            dense_grid_candidates_for_cell(&polygon_index.grid, left_cell),
+            None,
+        );
+        let right_inside = point_in_polygons_from_candidates(
+            right,
+            polygon_index,
+            dense_grid_candidates_for_cell(&polygon_index.grid, right_cell),
+            None,
+        );
+        return (left_inside, right_inside);
+    }
+
+    let candidates = dense_grid_candidates_for_cell(&polygon_index.grid, left_cell);
+    let mut left_inside = false;
+    let mut right_inside = false;
+    for &polygon_index_id in candidates {
+        if left_inside && right_inside {
+            break;
+        }
+
+        let polygon = &polygon_index.polygons[polygon_index_id];
+        if !left_inside
+            && bounds_contains_point(polygon.bounds, left)
+            && point_in_polygon_points(left, &polygon.points)
+        {
+            left_inside = true;
+        }
+        if !right_inside
+            && bounds_contains_point(polygon.bounds, right)
+            && point_in_polygon_points(right, &polygon.points)
+        {
+            right_inside = true;
+        }
+    }
+
+    (left_inside, right_inside)
 }
 
 fn segment_side_states(
@@ -2102,6 +2216,7 @@ fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex<'_> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn point_in_polygons(
     point: [f32; 2],
     polygon_index: &PolygonIndex<'_>,
@@ -2112,6 +2227,15 @@ fn point_in_polygons(
     }
 
     let candidates = dense_grid_candidates_for_point(&polygon_index.grid, point);
+    point_in_polygons_from_candidates(point, polygon_index, candidates, stats)
+}
+
+fn point_in_polygons_from_candidates(
+    point: [f32; 2],
+    polygon_index: &PolygonIndex<'_>,
+    candidates: &[usize],
+    mut stats: Option<&mut ClassificationStats>,
+) -> bool {
     if let Some(stats) = stats.as_mut() {
         stats.candidate_polygons += candidates.len();
     }
@@ -2133,10 +2257,19 @@ fn point_in_polygons(
     false
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn dense_grid_candidates_for_point(grid: &DenseGridIndex, point: [f32; 2]) -> &[usize] {
+    let cell_index = dense_grid_cell_index_for_point(grid, point);
+    dense_grid_candidates_for_cell(grid, cell_index)
+}
+
+fn dense_grid_cell_index_for_point(grid: &DenseGridIndex, point: [f32; 2]) -> usize {
     let x = cell_coord(point[0], grid.min[0], grid.cell_size[0], grid.resolution);
     let y = cell_coord(point[1], grid.min[1], grid.cell_size[1], grid.resolution);
-    let cell_index = dense_cell_index(x, y, grid.resolution);
+    dense_cell_index(x, y, grid.resolution)
+}
+
+fn dense_grid_candidates_for_cell(grid: &DenseGridIndex, cell_index: usize) -> &[usize] {
     let start = grid.cell_starts[cell_index];
     let end = grid.cell_starts[cell_index + 1];
     &grid.indices[start..end]
