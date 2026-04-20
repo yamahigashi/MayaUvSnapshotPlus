@@ -247,6 +247,18 @@ fn pair_profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn split_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_SPLIT_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn arrangement_detail_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_ARRANGEMENT_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 fn log_profile(label: &str, started_at: Instant) {
     if profile_enabled() {
         eprintln!(
@@ -574,6 +586,7 @@ fn build_segment_arrangement_from_parts(
         })
         .collect::<Vec<_>>();
 
+    let pair_pass_started_at = Instant::now();
     visit_candidate_pairs(&segment_bounds, 0.0, |left_index, right_index| {
         let left = original_segments[left_index];
         let right = original_segments[right_index];
@@ -593,6 +606,12 @@ fn build_segment_arrangement_from_parts(
             split_points.as_mut_slice(),
         );
     });
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_pairs", pair_pass_started_at);
+    }
+
+    log_split_point_profile(split_points.as_slice());
+    normalize_split_points(split_points.as_mut_slice());
 
     if split_points.iter().all(|points| points.is_empty()) {
         return SegmentArrangement {
@@ -602,6 +621,7 @@ fn build_segment_arrangement_from_parts(
         };
     }
 
+    let finalize_started_at = Instant::now();
     let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> =
         HashMap::new();
     for (segment_index, points) in split_points.iter().enumerate() {
@@ -646,6 +666,9 @@ fn build_segment_arrangement_from_parts(
         parts.sort_by_key(|segment| (segment.start, segment.end));
         parts.dedup();
         group_segments.push(parts);
+    }
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_finalize", finalize_started_at);
     }
 
     SegmentArrangement {
@@ -764,6 +787,57 @@ fn register_split_point_for_segment(
     insert_point_position(point_positions, quantized, point);
 }
 
+fn log_split_point_profile(split_points: &[Vec<QPoint>]) {
+    if !split_profile_enabled() {
+        return;
+    }
+
+    let mut non_empty_segments = 0usize;
+    let mut raw_total = 0usize;
+    let mut unique_total = 0usize;
+    let mut duplicate_total = 0usize;
+    let mut max_raw_len = 0usize;
+
+    for points in split_points {
+        if points.is_empty() {
+            continue;
+        }
+        non_empty_segments += 1;
+        raw_total += points.len();
+        max_raw_len = max_raw_len.max(points.len());
+
+        let unique_len = if points.len() <= 1 {
+            points.len()
+        } else {
+            let mut unique_points = points.clone();
+            unique_points.sort_unstable();
+            unique_points.dedup();
+            unique_points.len()
+        };
+        unique_total += unique_len;
+        duplicate_total += points.len() - unique_len;
+    }
+
+    eprintln!(
+        "edge_drawer: split_stats segments={} raw_points={} unique_points={} duplicates={} max_points_per_segment={}",
+        non_empty_segments,
+        raw_total,
+        unique_total,
+        duplicate_total,
+        max_raw_len,
+    );
+}
+
+fn normalize_split_points(split_points: &mut [Vec<QPoint>]) {
+    for points in split_points {
+        if points.len() <= 1 {
+            continue;
+        }
+        points.sort_unstable();
+        points.dedup();
+    }
+}
+
 fn is_segment_endpoint(segment: CanonicalSegment, point: QPoint) -> bool {
     point == segment.start || point == segment.end
 }
@@ -794,12 +868,9 @@ fn split_segment(
     if split_points.is_empty() {
         return vec![original];
     }
-    let mut unique_split_points = split_points.to_vec();
-    unique_split_points.sort_unstable();
-    unique_split_points.dedup();
 
-    if unique_split_points.len() == 1 {
-        let point = unique_split_points[0];
+    if split_points.len() == 1 {
+        let point = split_points[0];
         let mut segments = Vec::with_capacity(2);
         if let Some(segment) = canonical_segment(original.start, point) {
             segments.push(segment);
@@ -810,20 +881,21 @@ fn split_segment(
         return segments;
     }
 
-    let mut ordered = Vec::with_capacity(unique_split_points.len() + 2);
-    ordered.push(original.start);
-    ordered.push(original.end);
-    ordered.extend(unique_split_points);
-    ordered.sort_by(|lhs, rhs| {
-        segment_parameter(point_position(point_positions, *lhs), start, end).total_cmp(
-            &segment_parameter(point_position(point_positions, *rhs), start, end),
+    let mut ordered = Vec::with_capacity(split_points.len() + 2);
+    ordered.push((original.start, 0.0));
+    ordered.push((original.end, 1.0));
+    ordered.extend(split_points.iter().copied().map(|point| {
+        (
+            point,
+            segment_parameter(point_position(point_positions, point), start, end),
         )
-    });
-    ordered.dedup();
+    }));
+    ordered.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
+    ordered.dedup_by_key(|entry| entry.0);
 
     let mut segments = Vec::new();
     for window in ordered.windows(2) {
-        if let Some(segment) = canonical_segment(window[0], window[1]) {
+        if let Some(segment) = canonical_segment(window[0].0, window[1].0) {
             segments.push(segment);
         }
     }
