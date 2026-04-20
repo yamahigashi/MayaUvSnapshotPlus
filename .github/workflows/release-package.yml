@@ -38,11 +38,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mayauvsnapshotplus-release-package
-          path: dist/mayauvsnapshotplus.zip
+          path: dist/mayauvsnapshotplus*.zip
           if-no-files-found: error
 
       - name: Publish release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/mayauvsnapshotplus.zip
+          files: dist/mayauvsnapshotplus*.zip
