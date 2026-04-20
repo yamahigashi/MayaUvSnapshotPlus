@@ -196,6 +196,13 @@ struct DenseGridIndex {
 }
 
 #[derive(Clone, Debug)]
+struct ArrangementGridIndex {
+    dense: DenseGridIndex,
+    segment_cell_starts: Vec<usize>,
+    segment_cells: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct PolygonIndex<'a> {
     polygons: Vec<IndexedPolygon<'a>>,
     grid: DenseGridIndex,
@@ -591,7 +598,6 @@ fn build_segment_arrangement_from_parts(
 
     let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> =
         HashMap::new();
-    let mut segments_set = original_segments.iter().copied().collect::<HashSet<_>>();
     for (segment_index, points) in split_points.iter().enumerate() {
         if points.is_empty() {
             continue;
@@ -599,15 +605,19 @@ fn build_segment_arrangement_from_parts(
 
         let segment = original_segments[segment_index];
         let parts = split_segment(segment, Some(points.as_slice()), &point_positions);
-        segments_set.remove(&segment);
-        for part in &parts {
-            segments_set.insert(*part);
-        }
         split_segments_by_original.insert(segment, parts);
     }
 
-    let mut segments = segments_set.into_iter().collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(original_segments.len());
+    for &original in &original_segments {
+        if let Some(parts) = split_segments_by_original.get(&original) {
+            segments.extend(parts.iter().copied());
+        } else {
+            segments.push(original);
+        }
+    }
     segments.sort_by_key(|segment| (segment.start, segment.end));
+    segments.dedup();
 
     let mut group_segments = Vec::with_capacity(original_group_segments.len());
     for original_group in original_group_segments {
@@ -619,16 +629,16 @@ fn build_segment_arrangement_from_parts(
             continue;
         }
 
-        let mut group_set = HashSet::new();
+        let mut parts = Vec::with_capacity(original_group.len());
         for original in original_group {
-            if let Some(parts) = split_segments_by_original.get(original) {
-                group_set.extend(parts.iter().copied());
+            if let Some(split_parts) = split_segments_by_original.get(original) {
+                parts.extend(split_parts.iter().copied());
             } else {
-                group_set.insert(*original);
+                parts.push(*original);
             }
         }
-        let mut parts = group_set.into_iter().collect::<Vec<_>>();
         parts.sort_by_key(|segment| (segment.start, segment.end));
+        parts.dedup();
         group_segments.push(parts);
     }
 
@@ -1093,7 +1103,6 @@ fn build_dense_grid(bounds: &[SegmentBounds], expand: f32, resolution: u32) -> D
     ];
     let cell_count = (resolution as usize) * (resolution as usize);
     let mut counts = vec![0usize; cell_count];
-
     for bounds in bounds.iter() {
         let min_x = cell_coord(bounds.min[0] - expand, min[0], cell_size[0], resolution);
         let max_x = cell_coord(bounds.max[0] + expand, min[0], cell_size[0], resolution);
@@ -1139,6 +1148,58 @@ fn build_dense_grid(bounds: &[SegmentBounds], expand: f32, resolution: u32) -> D
     }
 }
 
+fn build_arrangement_grid(
+    bounds: &[SegmentBounds],
+    expand: f32,
+    resolution: u32,
+) -> ArrangementGridIndex {
+    let dense = build_dense_grid(bounds, expand, resolution);
+    let mut segment_cell_starts = Vec::with_capacity(bounds.len() + 1);
+    let mut segment_cells = Vec::new();
+    segment_cell_starts.push(0);
+
+    for bounds in bounds.iter() {
+        let min_x = cell_coord(
+            bounds.min[0] - expand,
+            dense.min[0],
+            dense.cell_size[0],
+            dense.resolution,
+        );
+        let max_x = cell_coord(
+            bounds.max[0] + expand,
+            dense.min[0],
+            dense.cell_size[0],
+            dense.resolution,
+        );
+        let min_y = cell_coord(
+            bounds.min[1] - expand,
+            dense.min[1],
+            dense.cell_size[1],
+            dense.resolution,
+        );
+        let max_y = cell_coord(
+            bounds.max[1] + expand,
+            dense.min[1],
+            dense.cell_size[1],
+            dense.resolution,
+        );
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                segment_cells.push(dense_cell_index(x, y, dense.resolution));
+            }
+        }
+
+        segment_cell_starts.push(segment_cells.len());
+    }
+
+    ArrangementGridIndex {
+        dense,
+        segment_cell_starts,
+        segment_cells,
+    }
+}
+
 fn visit_candidate_pairs<F>(bounds: &[SegmentBounds], expand: f32, mut visitor: F)
 where
     F: FnMut(usize, usize),
@@ -1147,7 +1208,7 @@ where
         return;
     }
 
-    let grid = build_dense_grid(
+    let grid = build_arrangement_grid(
         bounds,
         expand,
         default_candidate_pair_grid_resolution(bounds.len()),
@@ -1162,48 +1223,23 @@ where
         }
 
         let current_bounds = bounds[current];
-        let min_x = cell_coord(
-            current_bounds.min[0] - expand,
-            grid.min[0],
-            grid.cell_size[0],
-            grid.resolution,
-        );
-        let max_x = cell_coord(
-            current_bounds.max[0] + expand,
-            grid.min[0],
-            grid.cell_size[0],
-            grid.resolution,
-        );
-        let min_y = cell_coord(
-            current_bounds.min[1] - expand,
-            grid.min[1],
-            grid.cell_size[1],
-            grid.resolution,
-        );
-        let max_y = cell_coord(
-            current_bounds.max[1] + expand,
-            grid.min[1],
-            grid.cell_size[1],
-            grid.resolution,
-        );
+        let cell_start = grid.segment_cell_starts[current];
+        let cell_end = grid.segment_cell_starts[current + 1];
 
-        for x in min_x..=max_x {
-            for y in min_y..=max_y {
-                let cell_index = dense_cell_index(x, y, grid.resolution);
-                let start = grid.cell_starts[cell_index];
-                let end = grid.cell_starts[cell_index + 1];
-                for &candidate in &grid.indices[start..end] {
-                    if candidate <= current {
-                        continue;
-                    }
-                    if visited_marks[candidate] == current_mark {
-                        continue;
-                    }
-                    visited_marks[candidate] = current_mark;
+        for &cell_index in &grid.segment_cells[cell_start..cell_end] {
+            let start = grid.dense.cell_starts[cell_index];
+            let end = grid.dense.cell_starts[cell_index + 1];
+            for &candidate in &grid.dense.indices[start..end] {
+                if candidate <= current {
+                    continue;
+                }
+                if visited_marks[candidate] == current_mark {
+                    continue;
+                }
+                visited_marks[candidate] = current_mark;
 
-                    if bounds_overlap(current_bounds, bounds[candidate], expand) {
-                        visitor(current, candidate);
-                    }
+                if bounds_overlap(current_bounds, bounds[candidate], expand) {
+                    visitor(current, candidate);
                 }
             }
         }
