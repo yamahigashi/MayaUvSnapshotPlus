@@ -241,6 +241,12 @@ fn profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn pair_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_PAIR_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 fn log_profile(label: &str, started_at: Instant) {
     if profile_enabled() {
         eprintln!(
@@ -661,13 +667,15 @@ fn register_pair_splits(
     point_positions: &mut PointPositionIndex,
     split_points: &mut [Vec<QPoint>],
 ) {
-    if segments_share_endpoint(left, right)
-        && !colinear_segments(left_start, left_end, right_start, right_end)
-    {
+    let o1 = orientation(left_start, left_end, right_start);
+    let o2 = orientation(left_start, left_end, right_end);
+    let colinear = o1.abs() <= AREA_EPSILON && o2.abs() <= AREA_EPSILON;
+
+    if segments_share_endpoint(left, right) && !colinear {
         return;
     }
 
-    if colinear_segments(left_start, left_end, right_start, right_end) {
+    if colinear {
         register_colinear_overlap_splits(
             left,
             right,
@@ -683,7 +691,19 @@ fn register_pair_splits(
         return;
     }
 
-    let Some(point) = segment_intersection_point(left_start, left_end, right_start, right_end)
+    let o3 = orientation(right_start, right_end, left_start);
+    let o4 = orientation(right_start, right_end, left_end);
+
+    let Some(point) = segment_intersection_point_from_orientations(
+        left_start,
+        left_end,
+        right_start,
+        right_end,
+        o1,
+        o2,
+        o3,
+        o4,
+    )
     else {
         return;
     };
@@ -1202,6 +1222,12 @@ where
     );
     let mut visited_marks = vec![0u32; bounds.len()];
     let mut current_mark = 1u32;
+    let pair_profile = pair_profile_enabled();
+    let mut segment_cell_visits = 0usize;
+    let mut dense_candidates = 0usize;
+    let mut duplicate_candidates = 0usize;
+    let mut ordered_pair_candidates = 0usize;
+    let mut overlap_candidates = 0usize;
 
     for current in 0..bounds.len() {
         if current_mark == u32::MAX {
@@ -1212,26 +1238,52 @@ where
         let current_bounds = bounds[current];
         let cell_start = grid.segment_cell_starts[current];
         let cell_end = grid.segment_cell_starts[current + 1];
+        if pair_profile {
+            segment_cell_visits += cell_end - cell_start;
+        }
 
         for &cell_index in &grid.segment_cells[cell_start..cell_end] {
             let start = grid.dense.cell_starts[cell_index];
             let end = grid.dense.cell_starts[cell_index + 1];
-            for &candidate in &grid.dense.indices[start..end] {
-                if candidate <= current {
-                    continue;
+            let candidates = &grid.dense.indices[start..end];
+            let first_higher = candidates.partition_point(|&candidate| candidate <= current);
+
+            for &candidate in &candidates[first_higher..] {
+                if pair_profile {
+                    dense_candidates += 1;
+                }
+                if pair_profile {
+                    ordered_pair_candidates += 1;
                 }
                 if visited_marks[candidate] == current_mark {
+                    if pair_profile {
+                        duplicate_candidates += 1;
+                    }
                     continue;
                 }
                 visited_marks[candidate] = current_mark;
 
                 if bounds_overlap(current_bounds, bounds[candidate], expand) {
+                    if pair_profile {
+                        overlap_candidates += 1;
+                    }
                     visitor(current, candidate);
                 }
             }
         }
 
         current_mark += 1;
+    }
+
+    if pair_profile {
+        eprintln!(
+            "edge_drawer: pair_stats cells={} dense_candidates={} ordered_candidates={} duplicates={} overlaps={}",
+            segment_cell_visits,
+            dense_candidates,
+            ordered_pair_candidates,
+            duplicate_candidates,
+            overlap_candidates,
+        );
     }
 }
 
@@ -1457,6 +1509,20 @@ fn segments_intersect(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) ->
     let o3 = orientation(b0, b1, a0);
     let o4 = orientation(b0, b1, a1);
 
+    segments_intersect_from_orientations(a0, a1, b0, b1, o1, o2, o3, o4)
+}
+
+fn segments_intersect_from_orientations(
+    a0: [f32; 2],
+    a1: [f32; 2],
+    b0: [f32; 2],
+    b1: [f32; 2],
+    o1: f32,
+    o2: f32,
+    o3: f32,
+    o4: f32,
+) -> bool {
+
     if o1.abs() <= AREA_EPSILON && on_segment(a0, b0, a1) {
         return true;
     }
@@ -1484,21 +1550,21 @@ fn on_segment(start: [f32; 2], point: [f32; 2], end: [f32; 2]) -> bool {
         && point[1] <= start[1].max(end[1]) + AREA_EPSILON
 }
 
-fn colinear_segments(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> bool {
-    orientation(a0, a1, b0).abs() <= AREA_EPSILON && orientation(a0, a1, b1).abs() <= AREA_EPSILON
-}
-
 fn point_on_segment(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> bool {
     orientation(start, end, point).abs() <= AREA_EPSILON && on_segment(start, point, end)
 }
 
-fn segment_intersection_point(
+fn segment_intersection_point_from_orientations(
     a0: [f32; 2],
     a1: [f32; 2],
     b0: [f32; 2],
     b1: [f32; 2],
+    o1: f32,
+    o2: f32,
+    o3: f32,
+    o4: f32,
 ) -> Option<[f32; 2]> {
-    if !segments_intersect(a0, a1, b0, b1) {
+    if !segments_intersect_from_orientations(a0, a1, b0, b1, o1, o2, o3, o4) {
         return None;
     }
 
