@@ -1,0 +1,17 @@
+edge_drawer: arrangement_collect_segments 0.0346s
+edge_drawer: arrangement_collect_original_dedup 0.0088s
+edge_drawer: arrangement_collect_group_indices 0.0046s
+edge_drawer: arrangement_collect_inputs 0.0518s
+edge_drawer: arrangement_setup 0.0154s
+edge_drawer: pair_stats cells=436402 dense_candidates=5606060 ordered_candidates=5606060 duplicates=1289889 overlaps=1162169
+edge_drawer: arrangement_pairs 0.0861s
+edge_drawer: arrangement_finalize_split_segments 0.0081s
+edge_drawer: arrangement_finalize_segments_rebuild 0.0051s
+edge_drawer: arrangement_finalize_group_rebuild 0.0064s
+edge_drawer: arrangement_finalize 0.0226s
+edge_drawer: arrangement 0.1989s
+edge_drawer: classification 0.1733s
+edge_drawer: warning 0.0000s
+edge_drawer: path_build 0.1019s
+edge_drawer: prepare_total 0.4774s
+edge_drawer: render_raster 0.1114s

@@ -1,0 +1,6 @@
+edge_drawer: arrangement 0.2095s
+edge_drawer: classification 0.1843s
+edge_drawer: warning 0.0000s
+edge_drawer: path_build 0.0974s
+edge_drawer: prepare_total 0.4956s
+edge_drawer: render_raster 0.1211s

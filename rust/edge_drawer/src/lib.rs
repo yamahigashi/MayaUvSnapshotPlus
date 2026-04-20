@@ -731,6 +731,8 @@ fn register_pair_splits(
     let o1 = orientation(left_start, left_end, right_start);
     let o2 = orientation(left_start, left_end, right_end);
     let colinear = o1.abs() <= AREA_EPSILON && o2.abs() <= AREA_EPSILON;
+    let left_straddles_right = (o1 > AREA_EPSILON && o2 < -AREA_EPSILON)
+        || (o1 < -AREA_EPSILON && o2 > AREA_EPSILON);
 
     if segments_share_endpoint(left, right) && !colinear {
         return;
@@ -749,6 +751,10 @@ fn register_pair_splits(
             point_positions,
             split_points,
         );
+        return;
+    }
+
+    if !left_straddles_right && o1.abs() > AREA_EPSILON && o2.abs() > AREA_EPSILON {
         return;
     }
 
@@ -1224,7 +1230,7 @@ fn default_candidate_pair_grid_resolution(count: usize) -> u32 {
     }
 
     let target = ((count as f32).sqrt().ceil() as u32).saturating_mul(2);
-    target.next_power_of_two().clamp(32, 512)
+    target.next_power_of_two().clamp(32, 256)
 }
 
 fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2]) {

@@ -1,0 +1,119 @@
+{
+  "run_id": "rust_native_20260420_102407",
+  "workload": {
+    "command": "EDGE_DRAWER_PROFILE=1 rust/edge_drawer/target/release/edge_drawer <out.png> 2048 2048 .agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "fixture": ".agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "width": 2048,
+    "height": 2048,
+    "build_mode": "release",
+    "profile_env": "EDGE_DRAWER_PROFILE=1",
+    "detail_profile_env": "EDGE_DRAWER_PROFILE=1 EDGE_DRAWER_ARRANGEMENT_PROFILE=1 EDGE_DRAWER_PAIR_PROFILE=1",
+    "primary_metric": "prepare_total"
+  },
+  "baseline": {
+    "prepare_total": [0.4867, 0.5040, 0.4993],
+    "arrangement": [0.2065, 0.2066, 0.2017],
+    "classification": [0.1800, 0.1884, 0.1896],
+    "path_build": [0.0958, 0.1052, 0.1048],
+    "render_raster": [0.1277, 0.1159, 0.1288]
+  },
+  "baseline_attribution": {
+    "arrangement_collect_segments": 0.0259,
+    "arrangement_collect_original_dedup": 0.0086,
+    "arrangement_collect_group_indices": 0.0027,
+    "arrangement_collect_inputs": 0.0402,
+    "arrangement_setup": 0.0106,
+    "pair_stats": {
+      "cells": 856350,
+      "dense_candidates": 4519211,
+      "ordered_candidates": 4519211,
+      "duplicates": 2045859,
+      "overlaps": 1162169
+    },
+    "arrangement_pairs": 0.0804,
+    "arrangement_finalize": 0.0183,
+    "prepare_total": 0.3971,
+    "arrangement": 0.1682,
+    "classification": 0.1398,
+    "path_build": 0.0858,
+    "render_raster": 0.1083
+  },
+  "iteration_1_rejected": {
+    "change": "Raise the candidate-pair grid resolution cap from 512 to 1024.",
+    "attribution": {
+      "arrangement_collect_segments": 0.0331,
+      "arrangement_collect_original_dedup": 0.0088,
+      "arrangement_collect_group_indices": 0.0034,
+      "arrangement_collect_inputs": 0.0487,
+      "arrangement_setup": 0.0151,
+      "pair_stats": {
+        "cells": 2158506,
+        "dense_candidates": 5726210,
+        "ordered_candidates": 5726210,
+        "duplicates": 4013801,
+        "overlaps": 1162169
+      },
+      "arrangement_pairs": 0.1231,
+      "arrangement_finalize": 0.0244,
+      "prepare_total": 0.5390,
+      "arrangement": 0.2359,
+      "classification": 0.1898,
+      "path_build": 0.1098,
+      "render_raster": 0.1230
+    },
+    "accepted": false
+  },
+  "accepted_final_validation": {
+    "change": "Lower the candidate-pair grid cap from 512 to 256 and add an early non-intersection reject in register_pair_splits().",
+    "prepare_total": [0.4871, 0.4815, 0.4986],
+    "arrangement": [0.1906, 0.1897, 0.1886],
+    "classification": [0.1743, 0.1791, 0.1844],
+    "path_build": [0.1182, 0.1089, 0.1220],
+    "render_raster": [0.1108, 0.1110, 0.1099],
+    "post_change_attribution_sample": {
+      "arrangement_collect_segments": 0.0346,
+      "arrangement_collect_original_dedup": 0.0088,
+      "arrangement_collect_group_indices": 0.0046,
+      "arrangement_collect_inputs": 0.0518,
+      "arrangement_setup": 0.0154,
+      "pair_stats": {
+        "cells": 436402,
+        "dense_candidates": 5606060,
+        "ordered_candidates": 5606060,
+        "duplicates": 1289889,
+        "overlaps": 1162169
+      },
+      "arrangement_pairs": 0.0861,
+      "arrangement_finalize": 0.0226,
+      "prepare_total": 0.4774,
+      "arrangement": 0.1989,
+      "classification": 0.1733,
+      "path_build": 0.1019,
+      "render_raster": 0.1114
+    },
+    "accepted": true
+  },
+  "comparison": {
+    "prepare_total_mean_baseline": 0.4966666667,
+    "prepare_total_mean_final": 0.4890666667,
+    "prepare_total_abs": -0.0076,
+    "prepare_total_pct": -1.5302013423,
+    "arrangement_mean_baseline": 0.2049333333,
+    "arrangement_mean_final": 0.1896333333,
+    "arrangement_abs": -0.0153,
+    "arrangement_pct": -7.4658425504,
+    "classification_mean_baseline": 0.1860,
+    "classification_mean_final": 0.1792666667,
+    "classification_abs": -0.0067333333,
+    "classification_pct": -3.6200716846,
+    "path_build_mean_baseline": 0.1019333333,
+    "path_build_mean_final": 0.1163666667,
+    "path_build_abs": 0.0144333334,
+    "path_build_pct": 14.1595814258,
+    "render_raster_mean_baseline": 0.1241333333,
+    "render_raster_mean_final": 0.1105666667,
+    "render_raster_abs": -0.0135666666,
+    "render_raster_pct": -10.9291084855
+  },
+  "confidence_note": "This workload remains noisy. A single detail sample can move meaningfully, so acceptance used the repeated 3-run non-detail workload comparison."
+}
