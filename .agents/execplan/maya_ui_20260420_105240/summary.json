@@ -1,0 +1,67 @@
+{
+  "run_id": "maya_ui_20260420_105240",
+  "workload": {
+    "command": "cmd.exe /c \"set MAYA_UV_SNAPSHOT_PROFILE=1 && test.bat\"",
+    "type": "maya_ui",
+    "primary_metric": "build_snapshot_payload",
+    "supporting_metrics": [
+      "collect_snapshots",
+      "collect_snapshots_faces",
+      "polygon_count",
+      "polygon_point_count"
+    ]
+  },
+  "environment": {
+    "date": "2026-04-20",
+    "timezone": "Asia/Tokyo",
+    "profile_env": "MAYA_UV_SNAPSHOT_PROFILE=1"
+  },
+  "baseline": {
+    "run_id": "perf_maya_ui_20260420_105251_529651_77040",
+    "means": {
+      "small": 0.0031505999892639616,
+      "medium": 0.016039833329462756,
+      "heavy": 0.039226999991418175
+    },
+    "heavy_profile": {
+      "collect_snapshots": 0.03428140003234148,
+      "collect_snapshots_faces": 0.03415830002631992,
+      "polygon_count": 149153,
+      "polygon_point_count": 526219
+    }
+  },
+  "post_change": {
+    "run_id": "perf_maya_ui_20260420_105354_771756_67652",
+    "means": {
+      "small": 6.960000609979033e-05,
+      "medium": 8.0933328717947e-05,
+      "heavy": 7.156668774162729e-05
+    },
+    "heavy_profile": {
+      "collect_snapshots": 5.699985194951296e-06,
+      "collect_snapshots_faces": 0.0,
+      "polygon_count": 0,
+      "polygon_point_count": 0
+    }
+  },
+  "validation": {
+    "run_id": "perf_maya_ui_20260420_105404_128482_35172",
+    "means": {
+      "small": 8.596668097500999e-05,
+      "medium": 6.933333740259211e-05,
+      "heavy": 8.943333523347974e-05
+    },
+    "heavy_profile": {
+      "collect_snapshots": 5.699985194951296e-06,
+      "collect_snapshots_faces": 0.0,
+      "polygon_count": 0,
+      "polygon_point_count": 0
+    }
+  },
+  "change": {
+    "summary": "Skip topology snapshot collection for empty UI requests with no enabled edge drawing and no padding warning.",
+    "files": [
+      "python/uv_snapshot_edge_drawer/ui.py"
+    ]
+  }
+}

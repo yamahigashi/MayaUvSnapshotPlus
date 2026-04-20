@@ -666,6 +666,11 @@ def _settings_need_edge_data(settings):
     return False
 
 
+def _settings_need_topology_snapshot(settings):
+    # type: (Dict[Text, Any]) -> bool
+    return _settings_need_edge_data(settings) or bool(settings["padding_warning_enabled"])
+
+
 def _build_drawer_config(settings, width_scale=1.0):
     # type: (Dict[Text, Any], float) -> drawer.EdgeLineDrawerConfig
     config = drawer.EdgeLineDrawerConfig()
@@ -815,14 +820,18 @@ def _build_snapshot_json(settings, width_scale=1.0):
 
     phase_started = time.perf_counter()
     needs_edge_data = _settings_need_edge_data(settings)
-    snapshots = [
-        drawer.get_mesh_topology_snapshot(
-            mesh_name,
-            include_edges=needs_edge_data,
-            include_polygons=True,
-        )
-        for mesh_name in mesh_names
-    ]
+    needs_topology_snapshot = _settings_need_topology_snapshot(settings)
+    if needs_topology_snapshot:
+        snapshots = [
+            drawer.get_mesh_topology_snapshot(
+                mesh_name,
+                include_edges=needs_edge_data,
+                include_polygons=True,
+            )
+            for mesh_name in mesh_names
+        ]
+    else:
+        snapshots = []
     snapshot_elapsed = time.perf_counter() - phase_started
     payload_data = _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale)
     if hasattr(payload_data, "__dict__"):
@@ -852,18 +861,20 @@ def _capture_preview_request(generation):
     preview_width, preview_height = _get_preview_dimensions(settings)
     width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
     needs_edge_data = _settings_need_edge_data(settings)
+    needs_topology_snapshot = _settings_need_topology_snapshot(settings)
     snapshots = []
     missing_meshes = []
-    for mesh_name in mesh_names:
-        snapshot = drawer.get_cached_mesh_topology_snapshot(
-            mesh_name,
-            include_edges=needs_edge_data,
-            include_polygons=True,
-        )
-        if snapshot is None:
-            missing_meshes.append(mesh_name)
-        else:
-            snapshots.append(snapshot)
+    if needs_topology_snapshot:
+        for mesh_name in mesh_names:
+            snapshot = drawer.get_cached_mesh_topology_snapshot(
+                mesh_name,
+                include_edges=needs_edge_data,
+                include_polygons=True,
+            )
+            if snapshot is None:
+                missing_meshes.append(mesh_name)
+            else:
+                snapshots.append(snapshot)
 
     return {
         "generation": generation,
