@@ -210,10 +210,12 @@ struct PolygonIndex<'a> {
     grid: DenseGridIndex,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct SamplePointKey {
-    x: i64,
-    y: i64,
+#[derive(Default)]
+struct ClassificationStats {
+    sample_queries: usize,
+    candidate_polygons: usize,
+    bounds_checks: usize,
+    point_in_polygon_tests: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -257,6 +259,12 @@ fn split_profile_enabled() -> bool {
 
 fn arrangement_detail_profile_enabled() -> bool {
     std::env::var("EDGE_DRAWER_ARRANGEMENT_PROFILE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn classification_detail_profile_enabled() -> bool {
+    std::env::var("EDGE_DRAWER_CLASSIFICATION_PROFILE")
         .map(|value| value == "1")
         .unwrap_or(false)
 }
@@ -1697,16 +1705,16 @@ fn classify_segments(
     }
 
     let polygon_index = build_polygon_index(polygons);
-    let mut sample_cache = HashMap::new();
-    let mut internal_segments = HashSet::new();
-    let mut outline_segments = HashSet::new();
+    let mut stats = classification_detail_profile_enabled().then(ClassificationStats::default);
+    let mut internal_segments = HashSet::with_capacity(unique_segments.len());
+    let mut outline_segments = HashSet::with_capacity(unique_segments.len());
 
     for &segment in unique_segments {
         let (left_inside, right_inside) = segment_side_states_with_polygons(
             segment,
             &polygon_index,
             point_positions,
-            &mut sample_cache,
+            stats.as_mut(),
         );
         match (left_inside, right_inside) {
             (true, true) => {
@@ -1717,6 +1725,16 @@ fn classify_segments(
             }
             (false, false) => {}
         }
+    }
+
+    if let Some(stats) = stats {
+        eprintln!(
+            "edge_drawer: classification_stats sample_queries={} candidate_polygons={} bounds_checks={} point_tests={}",
+            stats.sample_queries,
+            stats.candidate_polygons,
+            stats.bounds_checks,
+            stats.point_in_polygon_tests,
+        );
     }
 
     (internal_segments, outline_segments)
@@ -1766,7 +1784,7 @@ fn segment_side_states_with_polygons(
     segment: CanonicalSegment,
     polygon_index: &PolygonIndex,
     point_positions: &PointPositionIndex,
-    sample_cache: &mut HashMap<SamplePointKey, bool>,
+    stats: Option<&mut ClassificationStats>,
 ) -> (bool, bool) {
     let a = point_position(point_positions, segment.start);
     let b = point_position(point_positions, segment.end);
@@ -1782,10 +1800,16 @@ fn segment_side_states_with_polygons(
     let left = [mid[0] + offset[0], mid[1] + offset[1]];
     let right = [mid[0] - offset[0], mid[1] - offset[1]];
 
-    (
-        point_in_polygons(left, polygon_index, sample_cache),
-        point_in_polygons(right, polygon_index, sample_cache),
-    )
+    if let Some(stats) = stats {
+        let left_inside = point_in_polygons(left, polygon_index, Some(&mut *stats));
+        let right_inside = point_in_polygons(right, polygon_index, Some(&mut *stats));
+        (left_inside, right_inside)
+    } else {
+        (
+            point_in_polygons(left, polygon_index, None),
+            point_in_polygons(right, polygon_index, None),
+        )
+    }
 }
 
 fn segment_side_states(
@@ -2031,34 +2055,34 @@ fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex<'_> {
     }
 }
 
-fn sample_point_key(point: [f32; 2]) -> SamplePointKey {
-    SamplePointKey {
-        x: (point[0] * 1_000_000.0).round() as i64,
-        y: (point[1] * 1_000_000.0).round() as i64,
-    }
-}
-
 fn point_in_polygons(
     point: [f32; 2],
     polygon_index: &PolygonIndex<'_>,
-    sample_cache: &mut HashMap<SamplePointKey, bool>,
+    mut stats: Option<&mut ClassificationStats>,
 ) -> bool {
-    let key = sample_point_key(point);
-    if let Some(is_inside) = sample_cache.get(&key) {
-        return *is_inside;
+    if let Some(stats) = stats.as_mut() {
+        stats.sample_queries += 1;
     }
 
-    for &polygon_index_id in dense_grid_candidates_for_point(&polygon_index.grid, point) {
+    let candidates = dense_grid_candidates_for_point(&polygon_index.grid, point);
+    if let Some(stats) = stats.as_mut() {
+        stats.candidate_polygons += candidates.len();
+    }
+    for &polygon_index_id in candidates {
         let polygon = &polygon_index.polygons[polygon_index_id];
+        if let Some(stats) = stats.as_mut() {
+            stats.bounds_checks += 1;
+        }
         if !bounds_contains_point(polygon.bounds, point) {
             continue;
         }
+        if let Some(stats) = stats.as_mut() {
+            stats.point_in_polygon_tests += 1;
+        }
         if point_in_polygon_points(point, &polygon.points) {
-            sample_cache.insert(key, true);
             return true;
         }
     }
-    sample_cache.insert(key, false);
     false
 }
 
@@ -3174,20 +3198,11 @@ mod tests {
     fn test_point_in_polygons_treats_overlaps_as_union() {
         let polygons = overlapping_polygons();
         let polygon_index = build_polygon_index(&polygons);
-        let mut sample_cache = HashMap::new();
-        assert!(point_in_polygons(
-            [0.5, 0.5],
-            &polygon_index,
-            &mut sample_cache
-        ));
-        assert!(!point_in_polygons(
-            [0.95, 0.95],
-            &polygon_index,
-            &mut sample_cache
-        ));
+        assert!(point_in_polygons([0.5, 0.5], &polygon_index, None));
+        assert!(!point_in_polygons([0.95, 0.95], &polygon_index, None));
         assert_eq!(
             point_in_polygons_bruteforce([0.5, 0.5], &polygons),
-            point_in_polygons([0.5, 0.5], &polygon_index, &mut sample_cache)
+            point_in_polygons([0.5, 0.5], &polygon_index, None)
         );
     }
 
