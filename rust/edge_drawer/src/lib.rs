@@ -2374,6 +2374,7 @@ fn build_polygon_buffers_from_indexed_uvs(
 
     let uv_len = all_us.len();
     let mut uv_index = 0usize;
+    let mut point_count = 0usize;
     for &face_uv_count in face_uv_counts {
         if face_uv_count == 0 {
             continue;
@@ -2383,6 +2384,7 @@ fn build_polygon_buffers_from_indexed_uvs(
         if next_uv_index > face_uv_ids.len() {
             return Err("face_uv_counts exceed face_uv_ids length".into());
         }
+        let face_uv_ids = &face_uv_ids[uv_index..next_uv_index];
 
         let start_len = polygon_points.len();
         let mut deduped_point_count = 0usize;
@@ -2391,16 +2393,13 @@ fn build_polygon_buffers_from_indexed_uvs(
         let mut previous_u = 0.0f32;
         let mut previous_v = 0.0f32;
         let mut has_previous = false;
-        let mut face_uv_index = uv_index;
 
-        while face_uv_index < next_uv_index {
-            let uv_id = face_uv_ids[face_uv_index];
+        for &uv_id in face_uv_ids {
             if uv_id >= uv_len {
                 return Err("face_uv_ids contain an out-of-range UV index".into());
             }
-            let u = all_us[uv_id];
-            let v = all_vs[uv_id];
-            face_uv_index += 1;
+            let u = unsafe { *all_us.get_unchecked(uv_id) };
+            let v = unsafe { *all_vs.get_unchecked(uv_id) };
 
             if has_previous && previous_u == u && previous_v == v {
                 continue;
@@ -2425,7 +2424,7 @@ fn build_polygon_buffers_from_indexed_uvs(
         if deduped_point_count < 3 {
             polygon_points.truncate(start_len);
         } else {
-            let point_count = *polygon_offsets.last().unwrap() + deduped_point_count;
+            point_count += deduped_point_count;
             polygon_offsets.push(point_count);
         }
 
