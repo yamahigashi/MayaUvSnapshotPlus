@@ -146,6 +146,13 @@ struct SegmentArrangement {
     group_segments: Vec<Vec<CanonicalSegment>>,
 }
 
+#[derive(Debug)]
+struct ArrangementInputs {
+    point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
+    original_segments: Vec<CanonicalSegment>,
+    group_segments: Vec<Vec<CanonicalSegment>>,
+}
+
 #[derive(Clone, Debug)]
 struct CompactPayload {
     styles: Vec<DrawStyle>,
@@ -174,8 +181,8 @@ struct UniformGridIndex {
 }
 
 #[derive(Clone, Debug)]
-struct IndexedPolygon {
-    points: Vec<[f32; 2]>,
+struct IndexedPolygon<'a> {
+    points: &'a [[f32; 2]],
     bounds: SegmentBounds,
 }
 
@@ -189,8 +196,8 @@ struct DenseGridIndex {
 }
 
 #[derive(Clone, Debug)]
-struct PolygonIndex {
-    polygons: Vec<IndexedPolygon>,
+struct PolygonIndex<'a> {
+    polygons: Vec<IndexedPolygon<'a>>,
     grid: DenseGridIndex,
 }
 
@@ -501,21 +508,6 @@ fn prepare_drawing_from_compact(
     PreparedDrawing { groups }
 }
 
-fn collect_point_positions(edges: &[Edges]) -> HashMap<QPoint, [f32; 2]> {
-    let mut positions = HashMap::new();
-    for group in edges {
-        for line in &group.lines {
-            positions
-                .entry(quantize_point(line.uv1))
-                .or_insert(line.uv1);
-            positions
-                .entry(quantize_point(line.uv2))
-                .or_insert(line.uv2);
-        }
-    }
-    positions
-}
-
 fn point_position(point_positions: &PointPositionIndex, point: QPoint) -> [f32; 2] {
     point_positions
         .base
@@ -533,25 +525,12 @@ fn insert_point_position(point_positions: &mut PointPositionIndex, point: QPoint
 }
 
 fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
-    let point_positions = Arc::new(collect_point_positions(edges));
-    let original_segments = collect_unique_segments(edges);
-    let mut group_segments = Vec::with_capacity(edges.len());
-    for group in edges {
-        let mut group_set = HashSet::new();
-        for line in &group.lines {
-            let Some(original) =
-                canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
-            else {
-                continue;
-            };
-            group_set.insert(original);
-        }
-        let mut parts = group_set.into_iter().collect::<Vec<_>>();
-        parts.sort_by_key(|segment| (segment.start, segment.end));
-        group_segments.push(parts);
-    }
-
-    build_segment_arrangement_from_parts(original_segments, point_positions, &group_segments)
+    let inputs = collect_arrangement_inputs(edges);
+    build_segment_arrangement_from_parts(
+        inputs.original_segments,
+        inputs.point_positions,
+        &inputs.group_segments,
+    )
 }
 
 fn build_segment_arrangement_from_parts(
@@ -1024,20 +1003,43 @@ fn materialize_style_buckets(
     groups
 }
 
-fn collect_unique_segments(edges: &[Edges]) -> Vec<CanonicalSegment> {
-    let mut set = HashSet::new();
+fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
+    let line_count = edges
+        .iter()
+        .map(|group| group.lines.len())
+        .sum::<usize>();
+    let mut point_positions = HashMap::with_capacity(line_count.saturating_mul(2));
+    let mut original_set = HashSet::with_capacity(line_count);
+    let mut group_segments = Vec::with_capacity(edges.len());
+
     for group in edges {
+        let mut group_set = HashSet::with_capacity(group.lines.len());
         for line in &group.lines {
-            if let Some(segment) =
-                canonical_segment(quantize_point(line.uv1), quantize_point(line.uv2))
-            {
-                set.insert(segment);
-            }
+            let start = quantize_point(line.uv1);
+            let end = quantize_point(line.uv2);
+            point_positions.entry(start).or_insert(line.uv1);
+            point_positions.entry(end).or_insert(line.uv2);
+
+            let Some(segment) = canonical_segment(start, end) else {
+                continue;
+            };
+            original_set.insert(segment);
+            group_set.insert(segment);
         }
+
+        let mut parts = group_set.into_iter().collect::<Vec<_>>();
+        parts.sort_by_key(|segment| (segment.start, segment.end));
+        group_segments.push(parts);
     }
-    let mut segments = set.into_iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| (segment.start, segment.end));
-    segments
+
+    let mut original_segments = original_set.into_iter().collect::<Vec<_>>();
+    original_segments.sort_by_key(|segment| (segment.start, segment.end));
+
+    ArrangementInputs {
+        point_positions: Arc::new(point_positions),
+        original_segments,
+        group_segments,
+    }
 }
 
 fn default_grid_resolution(count: usize) -> u32 {
@@ -1762,7 +1764,7 @@ fn point_in_faces(
     inside
 }
 
-fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
+fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex<'_> {
     let indexed_polygons = polygons
         .iter()
         .map(|polygon| {
@@ -1775,7 +1777,7 @@ fn build_polygon_index(polygons: &[Polygon]) -> PolygonIndex {
                 max[1] = max[1].max(point[1]);
             }
             IndexedPolygon {
-                points: polygon.points.clone(),
+                points: polygon.points.as_slice(),
                 bounds: SegmentBounds { min, max },
             }
         })
@@ -1800,7 +1802,7 @@ fn sample_point_key(point: [f32; 2]) -> SamplePointKey {
 
 fn point_in_polygons(
     point: [f32; 2],
-    polygon_index: &PolygonIndex,
+    polygon_index: &PolygonIndex<'_>,
     sample_cache: &mut HashMap<SamplePointKey, bool>,
 ) -> bool {
     let key = sample_point_key(point);
