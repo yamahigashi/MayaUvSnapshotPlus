@@ -1051,6 +1051,15 @@ fn default_grid_resolution(count: usize) -> u32 {
     target.next_power_of_two().clamp(16, 256)
 }
 
+fn default_candidate_pair_grid_resolution(count: usize) -> u32 {
+    if count <= 1 {
+        return 32;
+    }
+
+    let target = ((count as f32).sqrt().ceil() as u32).saturating_mul(2);
+    target.next_power_of_two().clamp(32, 512)
+}
+
 fn combine_bounds(bounds: &[SegmentBounds], expand: f32) -> ([f32; 2], [f32; 2]) {
     let mut min = [f32::INFINITY, f32::INFINITY];
     let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
@@ -1138,29 +1147,68 @@ where
         return;
     }
 
-    let mut sorted_indices = (0..bounds.len()).collect::<Vec<_>>();
-    sorted_indices.sort_by(|lhs, rhs| {
-        bounds[*lhs].min[0]
-            .total_cmp(&bounds[*rhs].min[0])
-            .then_with(|| bounds[*lhs].max[0].total_cmp(&bounds[*rhs].max[0]))
-    });
+    let grid = build_dense_grid(
+        bounds,
+        expand,
+        default_candidate_pair_grid_resolution(bounds.len()),
+    );
+    let mut visited_marks = vec![0u32; bounds.len()];
+    let mut current_mark = 1u32;
 
-    let mut active = Vec::<usize>::new();
-    for &current in &sorted_indices {
-        let current_min_x = bounds[current].min[0] - expand;
-        active.retain(|idx| bounds[*idx].max[0] + expand >= current_min_x);
+    for current in 0..bounds.len() {
+        if current_mark == u32::MAX {
+            visited_marks.fill(0);
+            current_mark = 1;
+        }
 
-        for &candidate in &active {
-            if bounds_overlap(bounds[current], bounds[candidate], expand) {
-                if candidate < current {
-                    visitor(candidate, current);
-                } else {
-                    visitor(current, candidate);
+        let current_bounds = bounds[current];
+        let min_x = cell_coord(
+            current_bounds.min[0] - expand,
+            grid.min[0],
+            grid.cell_size[0],
+            grid.resolution,
+        );
+        let max_x = cell_coord(
+            current_bounds.max[0] + expand,
+            grid.min[0],
+            grid.cell_size[0],
+            grid.resolution,
+        );
+        let min_y = cell_coord(
+            current_bounds.min[1] - expand,
+            grid.min[1],
+            grid.cell_size[1],
+            grid.resolution,
+        );
+        let max_y = cell_coord(
+            current_bounds.max[1] + expand,
+            grid.min[1],
+            grid.cell_size[1],
+            grid.resolution,
+        );
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                let cell_index = dense_cell_index(x, y, grid.resolution);
+                let start = grid.cell_starts[cell_index];
+                let end = grid.cell_starts[cell_index + 1];
+                for &candidate in &grid.indices[start..end] {
+                    if candidate <= current {
+                        continue;
+                    }
+                    if visited_marks[candidate] == current_mark {
+                        continue;
+                    }
+                    visited_marks[candidate] = current_mark;
+
+                    if bounds_overlap(current_bounds, bounds[candidate], expand) {
+                        visitor(current, candidate);
+                    }
                 }
             }
         }
 
-        active.push(current);
+        current_mark += 1;
     }
 }
 
