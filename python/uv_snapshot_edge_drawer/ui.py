@@ -43,18 +43,19 @@ if sys.version_info > (3, 0):
 ##############################################################################
 
 EDGE_APPEARANCE_SPECS = [
-    ("soft", "Soft Edge", (0.8, 0.8, 0.8), 1),
-    ("hard", "Hard Edge", (0.0, 0.75, 1.0), 3),
-    ("border", "Border Edge", (1.0, 0.0, 0.0), 6),
-    ("boundary", "Boundary Edge", (1.0, 0.0, 0.0), 6),
-    ("crease", "Crease Edge", (1.0, 1.0, 0.0), 2),
-    ("fold", "Fold Edge", (0.75, 0.75, 0.0), 2),
+    ("soft",     "Soft Edge",     (0.8,  0.8,  0.8), 1),
+    ("hard",     "Hard Edge",     (0.0,  0.75, 1.0), 3),
+    ("border",   "Border Edge",   (1.0,  0.0,  0.0), 6),
+    ("boundary", "Boundary Edge", (1.0,  0.0,  0.0), 6),
+    ("crease",   "Crease Edge",   (1.0,  1.0,  0.0), 2),
+    ("fold",     "Fold Edge",     (0.75, 0.75, 0.0), 2),
 ]
 PREVIEW_MAX_DIMENSION = 512
-WARNING_COLOR = (1.0, 0.25, 0.25)
-WARNING_WIDTH = 4
+WARNING_COLOR = (1.0, 0.43, 0.05)
+WARNING_WIDTH = 16
 PREVIEW_DEBOUNCE_MS = 150
 PREVIEW_RENDER_WORKERS = 1
+PREVIEW_FRAME_LABEL = "Preview"
 
 
 try:
@@ -617,7 +618,7 @@ def _collect_snapshot_settings():
         "padding_warning_enabled": cmds.checkBox("paddingWarningEnabled", query=True, value=True),
         "padding_pixels": cmds.intField("paddingPixelsField", query=True, value=True),
         "padding_warning_color": _get_warning_color(),
-        "padding_warning_width": cmds.intField("paddingWarningWidthField", query=True, value=True),
+        "padding_warning_width": cmds.intField("paddingWarningEdgeWidthField", query=True, value=True),
         "soft_internal_color": _get_edge_color("soft", "Internal"),
         "hard_internal_color": _get_edge_color("hard", "Internal"),
         "border_internal_color": _get_edge_color("border", "Internal"),
@@ -664,11 +665,6 @@ def _settings_need_edge_data(settings):
         if settings["{}_draw_internal".format(edge_key)] or settings["{}_draw_outline".format(edge_key)]:
             return True
     return False
-
-
-def _settings_need_topology_snapshot(settings):
-    # type: (Dict[Text, Any]) -> bool
-    return _settings_need_edge_data(settings) or bool(settings["padding_warning_enabled"])
 
 
 def _build_drawer_config(settings, width_scale=1.0):
@@ -820,18 +816,14 @@ def _build_snapshot_json(settings, width_scale=1.0):
 
     phase_started = time.perf_counter()
     needs_edge_data = _settings_need_edge_data(settings)
-    needs_topology_snapshot = _settings_need_topology_snapshot(settings)
-    if needs_topology_snapshot:
-        snapshots = [
-            drawer.get_mesh_topology_snapshot(
-                mesh_name,
-                include_edges=needs_edge_data,
-                include_polygons=True,
-            )
-            for mesh_name in mesh_names
-        ]
-    else:
-        snapshots = []
+    snapshots = [
+        drawer.get_mesh_topology_snapshot(
+            mesh_name,
+            include_edges=needs_edge_data,
+            include_polygons=True,
+        )
+        for mesh_name in mesh_names
+    ]
     snapshot_elapsed = time.perf_counter() - phase_started
     payload_data = _build_payload_from_snapshots(settings, snapshots, width_scale=width_scale)
     if hasattr(payload_data, "__dict__"):
@@ -861,20 +853,18 @@ def _capture_preview_request(generation):
     preview_width, preview_height = _get_preview_dimensions(settings)
     width_scale = float(preview_width) / float(max(1, int(settings["x_resolution"])))
     needs_edge_data = _settings_need_edge_data(settings)
-    needs_topology_snapshot = _settings_need_topology_snapshot(settings)
     snapshots = []
     missing_meshes = []
-    if needs_topology_snapshot:
-        for mesh_name in mesh_names:
-            snapshot = drawer.get_cached_mesh_topology_snapshot(
-                mesh_name,
-                include_edges=needs_edge_data,
-                include_polygons=True,
-            )
-            if snapshot is None:
-                missing_meshes.append(mesh_name)
-            else:
-                snapshots.append(snapshot)
+    for mesh_name in mesh_names:
+        snapshot = drawer.get_cached_mesh_topology_snapshot(
+            mesh_name,
+            include_edges=needs_edge_data,
+            include_polygons=True,
+        )
+        if snapshot is None:
+            missing_meshes.append(mesh_name)
+        else:
+            snapshots.append(snapshot)
 
     return {
         "generation": generation,
@@ -898,17 +888,20 @@ def _get_preview_dimensions(settings):
 
 def _set_preview_placeholder(message):
     # type: (Text) -> None
+    cmds.frameLayout("previewFrame", edit=True, label=PREVIEW_FRAME_LABEL)
     cmds.image("previewImage", edit=True, visible=False, image="")
     cmds.text("previewStatus", edit=True, visible=True, label=message)
 
 
 def _set_preview_busy(message):
     # type: (Text) -> None
-    cmds.text("previewStatus", edit=True, visible=True, label=message)
+    cmds.frameLayout("previewFrame", edit=True, label="{} ({})".format(PREVIEW_FRAME_LABEL, message))
+    cmds.text("previewStatus", edit=True, visible=False)
 
 
 def _set_preview_image(image_path, width, height):
     # type: (Text, int, int) -> None
+    cmds.frameLayout("previewFrame", edit=True, label=PREVIEW_FRAME_LABEL)
     cmds.text("previewStatus", edit=True, visible=False)
     cmds.image(
         "previewImage",
@@ -1060,14 +1053,24 @@ def show_ui():
     cmds.intSliderGrp("resoX", label="Size X (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
     cmds.intSliderGrp("resoY", label="Size Y (px):", field=True, min=1, max=4096, value=2048)  # noqa: E501
     cmds.rowLayout(
-        numberOfColumns=6,
-        adjustableColumn=2,
-        columnAlign=[(1, "right"), (2, "left"), (3, "left"), (4, "left"), (5, "right"), (6, "left")],
-        columnWidth=[(1, 120), (2, 100), (3, 72), (4, 24), (5, 42), (6, 48)],
+        numberOfColumns=7,
+        adjustableColumn=7,
+        columnAlign=[(1, "right"), (2, "left"), (3, "left"), (4, "left"), (5, "right"), (6, "left"), (7, "left")],
+        columnAttach=[
+            (1, "both", 0),
+            (2, "both", 0),
+            (3, "both", 0),
+            (4, "both", 0),
+            (5, "both", 0),
+            (6, "both", 0),
+            (7, "both", 0),
+        ],
+        columnWidth=[(1, 120), (2, 16), (3, 53), (4, 24), (5, 36), (6, 42), (7, 48)],
     )
+    cmds.text(label="Padding Warning:", align="right")
     cmds.checkBox(
         "paddingWarningEnabled",
-        label="Padding Warning",
+        label="",
         value=False,
         changeCommand=lambda *_args: (_update_padding_warning_controls(), schedule_preview_refresh(immediate=True)),
     )
@@ -1088,15 +1091,22 @@ def show_ui():
     )
     cmds.text(label="Width", align="right")
     cmds.intField(
-        "paddingWarningWidthField",
+        "paddingWarningEdgeWidthField",
         minValue=1,
         maxValue=100,
         value=WARNING_WIDTH,
-        changeCommand=lambda *_args: schedule_preview_refresh(immediate=True),
+        changeCommand=lambda value, key="paddingWarning": _sync_width_from_field(key, "", value),
+    )
+    cmds.intSlider(
+        "paddingWarningEdgeWidthSlider",
+        min=1,
+        max=100,
+        value=WARNING_WIDTH,
+        step=1,
+        dragCommand=lambda value, key="paddingWarning": _sync_width_from_slider(key, "", value),
+        changeCommand=lambda value, key="paddingWarning": _sync_width_from_slider(key, "", value),
     )
     cmds.setParent("..")
-    
-    cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501
 
     slider_width = gOptionBoxTemplateTextColumnWidth + gOptionBoxTemplateSliderWidgetWidth + 72
     for edge_key, label, color, width in EDGE_APPEARANCE_SPECS:
@@ -1106,6 +1116,8 @@ def show_ui():
         cmds.checkBox(_edge_control_name("border", "DrawInternal"), edit=True, value=False)
         cmds.checkBox(_edge_control_name("border", "Outline"), edit=True, value=False)
         _set_edge_row_enabled("border", False)
+    
+    cmds.intSliderGrp("foldAngle", label="Fold Angle", field=True, minValue=0.0, maxValue=360.0, value=60.0)  # noqa: E501
 
     cmds.setParent("..")  # End the frameLayout
 
@@ -1184,7 +1196,7 @@ def show_ui():
 
         cmds.setParent("..")  # End the frameLayout
 
-    cmds.frameLayout(label="Preview", collapsable=True, collapse=False)
+    cmds.frameLayout("previewFrame", label=PREVIEW_FRAME_LABEL, collapsable=True, collapse=False)
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6, columnAttach=("both", 8))
     cmds.text("previewStatus", label="Select a mesh to preview", align="center")
     cmds.image("previewImage", visible=False, width=PREVIEW_MAX_DIMENSION, height=PREVIEW_MAX_DIMENSION)
@@ -1243,7 +1255,8 @@ def _update_padding_warning_controls():
     enabled = cmds.checkBox("paddingWarningEnabled", query=True, value=True)
     cmds.intField("paddingPixelsField", edit=True, enable=enabled)
     cmds.button("paddingWarningColorSwatch", edit=True, enable=enabled)
-    cmds.intField("paddingWarningWidthField", edit=True, enable=enabled)
+    cmds.intField("paddingWarningEdgeWidthField", edit=True, enable=enabled)
+    cmds.intSlider("paddingWarningEdgeWidthSlider", edit=True, enable=enabled)
 
 
 def get_uv_min_max():
