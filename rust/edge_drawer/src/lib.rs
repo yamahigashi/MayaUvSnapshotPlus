@@ -580,6 +580,7 @@ fn build_segment_arrangement_from_parts(
     original_group_segments: &[Vec<CanonicalSegment>],
     original_group_segment_indices: &[Vec<usize>],
 ) -> SegmentArrangement {
+    let detail_profile = arrangement_detail_profile_enabled();
     let mut point_positions = PointPositionIndex {
         base: base_point_positions,
         extra: HashMap::new(),
@@ -643,6 +644,7 @@ fn build_segment_arrangement_from_parts(
     }
 
     let finalize_started_at = Instant::now();
+    let split_materialize_started_at = Instant::now();
     let mut split_segments_by_index = vec![None::<Vec<CanonicalSegment>>; original_segments.len()];
     for (segment_index, points) in split_points.iter().enumerate() {
         if points.is_empty() {
@@ -653,7 +655,14 @@ fn build_segment_arrangement_from_parts(
         let parts = split_segment(segment, Some(points.as_slice()), &point_positions);
         split_segments_by_index[segment_index] = Some(parts);
     }
+    if detail_profile {
+        log_profile(
+            "arrangement_finalize_split_segments",
+            split_materialize_started_at,
+        );
+    }
 
+    let flatten_segments_started_at = Instant::now();
     let mut segments = Vec::with_capacity(original_segments.len());
     for (segment_index, &original) in original_segments.iter().enumerate() {
         if let Some(parts) = split_segments_by_index[segment_index].as_ref() {
@@ -662,9 +671,15 @@ fn build_segment_arrangement_from_parts(
             segments.push(original);
         }
     }
-    segments.sort_by_key(|segment| (segment.start, segment.end));
-    segments.dedup();
+    dedup_sorted_segments_in_place(&mut segments);
+    if detail_profile {
+        log_profile(
+            "arrangement_finalize_segments_rebuild",
+            flatten_segments_started_at,
+        );
+    }
 
+    let rebuild_groups_started_at = Instant::now();
     let mut group_segments = Vec::with_capacity(original_group_segments.len());
     for (original_group, group_indices) in original_group_segments
         .iter()
@@ -686,11 +701,11 @@ fn build_segment_arrangement_from_parts(
                 parts.push(original_segments[segment_index]);
             }
         }
-        parts.sort_by_key(|segment| (segment.start, segment.end));
-        parts.dedup();
+        dedup_sorted_segments_in_place(&mut parts);
         group_segments.push(parts);
     }
-    if arrangement_detail_profile_enabled() {
+    if detail_profile {
+        log_profile("arrangement_finalize_group_rebuild", rebuild_groups_started_at);
         log_profile("arrangement_finalize", finalize_started_at);
     }
 
@@ -865,6 +880,23 @@ fn is_segment_endpoint(segment: CanonicalSegment, point: QPoint) -> bool {
     point == segment.start || point == segment.end
 }
 
+fn dedup_sorted_segments_in_place(segments: &mut Vec<CanonicalSegment>) {
+    if segments.len() <= 1 {
+        return;
+    }
+
+    let mut write_index = 1usize;
+    for read_index in 1..segments.len() {
+        if segments[read_index] != segments[write_index - 1] {
+            if write_index != read_index {
+                segments[write_index] = segments[read_index];
+            }
+            write_index += 1;
+        }
+    }
+    segments.truncate(write_index);
+}
+
 fn segments_share_endpoint(left: CanonicalSegment, right: CanonicalSegment) -> bool {
     left.start == right.start
         || left.start == right.end
@@ -875,16 +907,8 @@ fn segments_share_endpoint(left: CanonicalSegment, right: CanonicalSegment) -> b
 fn split_segment(
     original: CanonicalSegment,
     split_points: Option<&[QPoint]>,
-    point_positions: &PointPositionIndex,
+    _point_positions: &PointPositionIndex,
 ) -> Vec<CanonicalSegment> {
-    let start = point_position(point_positions, original.start);
-    let end = point_position(point_positions, original.end);
-    let direction = [end[0] - start[0], end[1] - start[1]];
-    let len_sq = direction[0] * direction[0] + direction[1] * direction[1];
-    if len_sq <= AREA_EPSILON {
-        return Vec::new();
-    }
-
     let Some(split_points) = split_points else {
         return vec![original];
     };
@@ -904,35 +928,18 @@ fn split_segment(
         return segments;
     }
 
-    let mut ordered = Vec::with_capacity(split_points.len() + 2);
-    ordered.push((original.start, 0.0));
-    ordered.push((original.end, 1.0));
-    ordered.extend(split_points.iter().copied().map(|point| {
-        (
-            point,
-            segment_parameter(point_position(point_positions, point), start, end),
-        )
-    }));
-    ordered.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
-    ordered.dedup_by_key(|entry| entry.0);
-
-    let mut segments = Vec::new();
-    for window in ordered.windows(2) {
-        if let Some(segment) = canonical_segment(window[0].0, window[1].0) {
+    let mut segments = Vec::with_capacity(split_points.len() + 1);
+    let mut previous = original.start;
+    for &point in split_points {
+        if let Some(segment) = canonical_segment(previous, point) {
             segments.push(segment);
         }
+        previous = point;
+    }
+    if let Some(segment) = canonical_segment(previous, original.end) {
+        segments.push(segment);
     }
     segments
-}
-
-fn segment_parameter(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
-    let dx = end[0] - start[0];
-    let dy = end[1] - start[1];
-    let len_sq = dx * dx + dy * dy;
-    if len_sq <= AREA_EPSILON {
-        return 0.0;
-    }
-    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / len_sq
 }
 
 #[cfg(test)]
@@ -3263,6 +3270,23 @@ mod tests {
         assert!(paths
             .iter()
             .any(|path| path == &vec![b, d] || path == &vec![d, b]));
+    }
+
+    #[test]
+    fn test_dedup_sorted_segments_in_place_keeps_sorted_unique_segments() {
+        let segment_a =
+            canonical_segment(quantize_point([0.0, 0.0]), quantize_point([1.0, 0.0])).unwrap();
+        let segment_b =
+            canonical_segment(quantize_point([1.0, 0.0]), quantize_point([2.0, 0.0])).unwrap();
+        let segment_c =
+            canonical_segment(quantize_point([2.0, 0.0]), quantize_point([3.0, 0.0])).unwrap();
+        let mut segments = vec![
+            segment_a, segment_a, segment_b, segment_b, segment_c, segment_c,
+        ];
+
+        dedup_sorted_segments_in_place(&mut segments);
+
+        assert_eq!(segments, vec![segment_a, segment_b, segment_c]);
     }
 
     fn arrangement_from_segments(segments: &[([f32; 2], [f32; 2])]) -> SegmentArrangement {
