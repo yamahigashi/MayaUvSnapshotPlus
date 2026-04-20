@@ -561,7 +561,11 @@ fn insert_point_position(point_positions: &mut PointPositionIndex, point: QPoint
 }
 
 fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
+    let collect_started_at = Instant::now();
     let inputs = collect_arrangement_inputs(edges);
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_collect_inputs", collect_started_at);
+    }
     build_segment_arrangement_from_parts(
         inputs.original_segments,
         inputs.point_positions,
@@ -580,6 +584,7 @@ fn build_segment_arrangement_from_parts(
         base: base_point_positions,
         extra: HashMap::new(),
     };
+    let setup_started_at = Instant::now();
     let segment_uvs = original_segments
         .iter()
         .map(|segment| {
@@ -598,6 +603,9 @@ fn build_segment_arrangement_from_parts(
             max: [start[0].max(end[0]), start[1].max(end[1])],
         })
         .collect::<Vec<_>>();
+    if arrangement_detail_profile_enabled() {
+        log_profile("arrangement_setup", setup_started_at);
+    }
 
     let pair_pass_started_at = Instant::now();
     visit_candidate_pairs(&segment_bounds, 0.0, |left_index, right_index| {
@@ -1113,11 +1121,11 @@ fn materialize_style_buckets(
 fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
     let line_count = edges.iter().map(|group| group.lines.len()).sum::<usize>();
     let mut point_positions = HashMap::with_capacity(line_count.saturating_mul(2));
-    let mut original_set = HashSet::with_capacity(line_count);
+    let mut original_segments = Vec::with_capacity(line_count);
     let mut group_segments = Vec::with_capacity(edges.len());
 
     for group in edges {
-        let mut group_set = HashSet::with_capacity(group.lines.len());
+        let mut parts = Vec::with_capacity(group.lines.len());
         for line in &group.lines {
             let start = quantize_point(line.uv1);
             let end = quantize_point(line.uv2);
@@ -1127,17 +1135,17 @@ fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
             let Some(segment) = canonical_segment(start, end) else {
                 continue;
             };
-            original_set.insert(segment);
-            group_set.insert(segment);
+            original_segments.push(segment);
+            parts.push(segment);
         }
 
-        let mut parts = group_set.into_iter().collect::<Vec<_>>();
-        parts.sort_by_key(|segment| (segment.start, segment.end));
+        parts.sort_unstable_by_key(|segment| (segment.start, segment.end));
+        parts.dedup();
         group_segments.push(parts);
     }
 
-    let mut original_segments = original_set.into_iter().collect::<Vec<_>>();
-    original_segments.sort_by_key(|segment| (segment.start, segment.end));
+    original_segments.sort_unstable_by_key(|segment| (segment.start, segment.end));
+    original_segments.dedup();
     let group_segment_indices = build_group_segment_indices(&original_segments, &group_segments);
 
     ArrangementInputs {
