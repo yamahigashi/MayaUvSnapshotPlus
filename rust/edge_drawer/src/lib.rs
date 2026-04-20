@@ -151,6 +151,7 @@ struct ArrangementInputs {
     point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     original_segments: Vec<CanonicalSegment>,
     group_segments: Vec<Vec<CanonicalSegment>>,
+    group_segment_indices: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +159,7 @@ struct CompactPayload {
     styles: Vec<DrawStyle>,
     arrangement_input_segments: Vec<CanonicalSegment>,
     arrangement_input_group_segments: Vec<Vec<CanonicalSegment>>,
+    arrangement_input_group_segment_indices: Vec<Vec<usize>>,
     point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     polygons: Vec<Polygon>,
     padding_warning: Option<PaddingWarningConfig>,
@@ -481,6 +483,7 @@ fn prepare_drawing_from_compact(
         payload.arrangement_input_segments.clone(),
         Arc::clone(&payload.point_positions),
         &payload.arrangement_input_group_segments,
+        &payload.arrangement_input_group_segment_indices,
     );
     log_profile("arrangement", arrangement_started_at);
 
@@ -555,6 +558,7 @@ fn build_segment_arrangement(edges: &[Edges]) -> SegmentArrangement {
         inputs.original_segments,
         inputs.point_positions,
         &inputs.group_segments,
+        &inputs.group_segment_indices,
     )
 }
 
@@ -562,6 +566,7 @@ fn build_segment_arrangement_from_parts(
     original_segments: Vec<CanonicalSegment>,
     base_point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     original_group_segments: &[Vec<CanonicalSegment>],
+    original_group_segment_indices: &[Vec<usize>],
 ) -> SegmentArrangement {
     let mut point_positions = PointPositionIndex {
         base: base_point_positions,
@@ -622,8 +627,7 @@ fn build_segment_arrangement_from_parts(
     }
 
     let finalize_started_at = Instant::now();
-    let mut split_segments_by_original: HashMap<CanonicalSegment, Vec<CanonicalSegment>> =
-        HashMap::new();
+    let mut split_segments_by_index = vec![None::<Vec<CanonicalSegment>>; original_segments.len()];
     for (segment_index, points) in split_points.iter().enumerate() {
         if points.is_empty() {
             continue;
@@ -631,12 +635,12 @@ fn build_segment_arrangement_from_parts(
 
         let segment = original_segments[segment_index];
         let parts = split_segment(segment, Some(points.as_slice()), &point_positions);
-        split_segments_by_original.insert(segment, parts);
+        split_segments_by_index[segment_index] = Some(parts);
     }
 
     let mut segments = Vec::with_capacity(original_segments.len());
-    for &original in &original_segments {
-        if let Some(parts) = split_segments_by_original.get(&original) {
+    for (segment_index, &original) in original_segments.iter().enumerate() {
+        if let Some(parts) = split_segments_by_index[segment_index].as_ref() {
             segments.extend(parts.iter().copied());
         } else {
             segments.push(original);
@@ -646,21 +650,24 @@ fn build_segment_arrangement_from_parts(
     segments.dedup();
 
     let mut group_segments = Vec::with_capacity(original_group_segments.len());
-    for original_group in original_group_segments {
-        if !original_group
+    for (original_group, group_indices) in original_group_segments
+        .iter()
+        .zip(original_group_segment_indices.iter())
+    {
+        if !group_indices
             .iter()
-            .any(|original| split_segments_by_original.contains_key(original))
+            .any(|&segment_index| split_segments_by_index[segment_index].is_some())
         {
             group_segments.push(original_group.clone());
             continue;
         }
 
         let mut parts = Vec::with_capacity(original_group.len());
-        for original in original_group {
-            if let Some(split_parts) = split_segments_by_original.get(original) {
+        for &segment_index in group_indices {
+            if let Some(split_parts) = split_segments_by_index[segment_index].as_ref() {
                 parts.extend(split_parts.iter().copied());
             } else {
-                parts.push(*original);
+                parts.push(original_segments[segment_index]);
             }
         }
         parts.sort_by_key(|segment| (segment.start, segment.end));
@@ -1123,12 +1130,34 @@ fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
 
     let mut original_segments = original_set.into_iter().collect::<Vec<_>>();
     original_segments.sort_by_key(|segment| (segment.start, segment.end));
+    let group_segment_indices = build_group_segment_indices(&original_segments, &group_segments);
 
     ArrangementInputs {
         point_positions: Arc::new(point_positions),
         original_segments,
         group_segments,
+        group_segment_indices,
     }
+}
+
+fn build_group_segment_indices(
+    original_segments: &[CanonicalSegment],
+    group_segments: &[Vec<CanonicalSegment>],
+) -> Vec<Vec<usize>> {
+    let segment_indices = original_segments
+        .iter()
+        .enumerate()
+        .map(|(index, &segment)| (segment, index))
+        .collect::<HashMap<_, _>>();
+
+    group_segments
+        .iter()
+        .map(|group| {
+            group.iter()
+                .map(|segment| segment_indices[segment])
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn default_grid_resolution(count: usize) -> u32 {
@@ -2556,10 +2585,13 @@ fn compact_payload_from_buffers(
         None
     };
 
+    let group_segment_indices = build_group_segment_indices(&original_segments, &group_segments);
+
     Ok(CompactPayload {
         styles,
         arrangement_input_segments: original_segments,
         arrangement_input_group_segments: group_segments,
+        arrangement_input_group_segment_indices: group_segment_indices,
         point_positions: Arc::new(point_positions),
         polygons,
         padding_warning,
@@ -3199,10 +3231,12 @@ mod tests {
             point_positions.entry(quantize_point(*end)).or_insert(*end);
         }
         let group_segments = vec![original_segments.clone()];
+        let group_segment_indices = vec![(0..original_segments.len()).collect::<Vec<_>>()];
         build_segment_arrangement_from_parts(
             original_segments,
             Arc::new(point_positions),
             &group_segments,
+            &group_segment_indices,
         )
     }
 
