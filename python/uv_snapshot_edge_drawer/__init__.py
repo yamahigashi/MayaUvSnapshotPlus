@@ -90,6 +90,7 @@ DEFAULT_PADDING_WARNING_COLOR = [255, 64, 64, 255]
 DEFAULT_PADDING_WARNING_WIDTH = 4.0
 TOPOLOGY_WARMUP_BATCH_ITEMS = 256
 TOPOLOGY_WARMUP_BUDGET_MS = 5.0
+WINDOWS_COMMAND_LINE_JSON_LIMIT = 30000
 
 
 def _profile_log(label, started_at):
@@ -1256,26 +1257,51 @@ def _normalize_output_path(image_path):
     return image_path + ".png"
 
 
-def _execute_drawer_cli(image_path, width, height, payload_data, native_error=None):
-    # type: (Text, int, int, Any, Optional[Exception]) -> None
-    """Execute the CLI fallback."""
+def _legacy_cli_json_payload(payload_data):
+    # type: (Any) -> Optional[Text]
+    """Build the legacy array-only payload accepted by older edge_drawer.exe builds."""
 
-    temp_path = None
+    if isinstance(payload_data, DrawerPayloadBuffers):
+        return edges_to_json_string(payload_data._json_fallback_edges)
+
+    if not isinstance(payload_data, str):
+        return None
+
     try:
-        json_data = payload_data.as_json_string() if isinstance(payload_data, DrawerPayloadBuffers) else payload_data
-        # Avoid Windows command line length limits in the fallback path.
-        if len(json_data) > 7500:
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
-                temp_file.write(json_data)
-                temp_path = temp_file.name
-            json_data = temp_path
+        parsed = json.loads(payload_data)
+    except Exception:  # noqa: E722
+        return None
 
+    if isinstance(parsed, dict) and isinstance(parsed.get("edges"), list):
+        return edges_to_json_string(parsed["edges"])
+
+    return None
+
+
+def _prepare_cli_json_arg(json_data):
+    # type: (Text) -> Tuple[Text, Optional[Text]]
+    """Return inline JSON when possible, otherwise spill to a temp file."""
+
+    if len(json_data) <= WINDOWS_COMMAND_LINE_JSON_LIMIT:
+        return json_data, None
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as temp_file:
+        temp_file.write(json_data)
+        return temp_file.name, temp_file.name
+
+
+def _run_drawer_cli_once(image_path, width, height, json_data, native_error=None):
+    # type: (Text, int, int, Text, Optional[Exception]) -> None
+    """Execute one edge_drawer CLI attempt."""
+
+    json_arg, temp_path = _prepare_cli_json_arg(json_data)
+    try:
         args = [
             "edge_drawer",
             image_path,
             str(width),
             str(height),
-            json_data,
+            json_arg,
         ]
 
         if sys.version_info > (3, 0):
@@ -1296,6 +1322,25 @@ def _execute_drawer_cli(image_path, width, height, payload_data, native_error=No
     finally:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def _execute_drawer_cli(image_path, width, height, payload_data, native_error=None):
+    # type: (Text, int, int, Any, Optional[Exception]) -> None
+    """Execute the CLI fallback."""
+
+    try:
+        json_data = payload_data.as_json_string() if isinstance(payload_data, DrawerPayloadBuffers) else payload_data
+        _run_drawer_cli_once(image_path, width, height, json_data, native_error=native_error)
+    except RuntimeError as exc:
+        legacy_json = _legacy_cli_json_payload(payload_data)
+        if legacy_json is None:
+            raise
+
+        error_text = str(exc)
+        if "Expected 'edges' to be an array" not in error_text and "contain 'edges'" not in error_text:
+            raise
+
+        _run_drawer_cli_once(image_path, width, height, legacy_json, native_error=native_error)
 
 
 ##############################################################################

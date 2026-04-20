@@ -7,9 +7,13 @@ edition = "2021"
 name = "edge_drawer"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+maya-abi3-py39 = ["pyo3/abi3-py39"]
+
 [dependencies]
 clap = "3.0"
-pyo3 = { version = "0.22.6", features = ["abi3-py37", "extension-module"] }
+pyo3 = { version = "0.22.6", features = ["extension-module"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 svg = "0.17.0"
