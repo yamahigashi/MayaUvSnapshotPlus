@@ -961,9 +961,9 @@ def _on_output_mode_changed(*args):
 def _copy_image_to_clipboard(image_path):
     # type: (Text) -> None
     try:
-        from PySide6 import QtGui, QtWidgets  # type: ignore
+        from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
     except Exception:
-        from PySide2 import QtGui, QtWidgets  # type: ignore
+        from PySide2 import QtCore, QtGui, QtWidgets  # type: ignore
 
     app = QtWidgets.QApplication.instance()
     if app is None:
@@ -974,7 +974,14 @@ def _copy_image_to_clipboard(image_path):
         raise RuntimeError("Failed to load clipboard image")
 
     clipboard = app.clipboard()
-    clipboard.setImage(image)
+    # Put the PNG bytes on the clipboard so downstream apps can preserve alpha.
+    with open(image_path, "rb") as image_file:
+        png_bytes = image_file.read()
+
+    mime_data = QtCore.QMimeData()
+    mime_data.setImageData(image)
+    mime_data.setData("image/png", QtCore.QByteArray(png_bytes))
+    clipboard.setMimeData(mime_data)
 
 
 def _render_snapshot_to_clipboard(settings, json_data):
@@ -1198,8 +1205,54 @@ def show_ui():
 
     cmds.frameLayout("previewFrame", label=PREVIEW_FRAME_LABEL, collapsable=True, collapse=False)
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6, columnAttach=("both", 8))
-    cmds.text("previewStatus", label="Select a mesh to preview", align="center")
+    cmds.rowLayout(
+        numberOfColumns=2,
+        adjustableColumn=2,
+        columnAlign=(1, "center"),
+        columnAttach=(1, "both", 0),
+    )
+    cmds.frameLayout(
+        "previewViewportFrame",
+        labelVisible=False,
+        borderVisible=True,
+        width=PREVIEW_MAX_DIMENSION,
+        height=PREVIEW_MAX_DIMENSION,
+        marginWidth=0,
+        marginHeight=0,
+    )
+    cmds.formLayout(
+        "previewViewportLayout",
+        width=PREVIEW_MAX_DIMENSION,
+        height=PREVIEW_MAX_DIMENSION,
+    )
+    cmds.text(
+        "previewStatus",
+        label="Select a mesh to preview",
+        align="center",
+        width=PREVIEW_MAX_DIMENSION,
+        height=20,
+    )
     cmds.image("previewImage", visible=False, width=PREVIEW_MAX_DIMENSION, height=PREVIEW_MAX_DIMENSION)
+    cmds.formLayout(
+        "previewViewportLayout",
+        edit=True,
+        attachForm=[
+            ("previewImage", "top", 0),
+            ("previewImage", "left", 0),
+            ("previewStatus", "left", 0),
+            ("previewStatus", "right", 0),
+        ],
+        attachNone=[
+            ("previewImage", "bottom"),
+            ("previewImage", "right"),
+            ("previewStatus", "bottom"),
+        ],
+        attachPosition=[
+            ("previewStatus", "top", -10, 50),
+        ],
+    )
+    cmds.setParent("..")
+    cmds.setParent("..")
     cmds.setParent("..")
     cmds.setParent("..")
 

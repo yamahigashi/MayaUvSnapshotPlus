@@ -19,7 +19,7 @@ It highlights edges by their type to help you create UV maps that are easier to 
 
 ## Supported Environments
 - **Operating System**: Windows
-- **Maya Version**: Autodesk Maya 2020 and later verisons.
+- **Maya Version**: Autodesk Maya 2022 and later verisons.
 
 
 ## Installation
