@@ -1,0 +1,133 @@
+{
+  "workload": {
+    "command": "EDGE_DRAWER_PROFILE=1 rust/edge_drawer/target/release/edge_drawer <out.png> 2048 2048 .agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "fixture": ".agents/execplan/rust_native_20260420_091318/large_sanitized_regen.json",
+    "width": 2048,
+    "height": 2048,
+    "build_mode": "release",
+    "profile_env": "EDGE_DRAWER_PROFILE=1",
+    "primary_metric": "prepare_total"
+  },
+  "baseline": {
+    "prepare_total": [0.6154, 0.5433, 0.5446],
+    "arrangement": [0.3041, 0.2839, 0.2797],
+    "classification": [0.2161, 0.1855, 0.1863],
+    "path_build": [0.0950, 0.0737, 0.0782],
+    "render_raster": [0.1080, 0.1032, 0.1016]
+  },
+  "baseline_attribution": {
+    "pair_stats": {
+      "cells": 856350,
+      "dense_candidates": 4519211,
+      "ordered_candidates": 4519211,
+      "duplicates": 2045859,
+      "overlaps": 1162169
+    },
+    "split_stats": {
+      "segments": 102833,
+      "raw_points": 272946,
+      "unique_points": 228466,
+      "duplicates": 44480,
+      "max_points_per_segment": 95
+    },
+    "arrangement_pairs": 0.0803,
+    "arrangement_finalize": 0.1232,
+    "arrangement": 0.3019,
+    "classification": 0.2038,
+    "path_build": 0.1097,
+    "prepare_total": 0.6154,
+    "render_raster": 0.1229
+  },
+  "iteration_1": {
+    "change": "Replace finalize-time split-part lookup storage with index-addressed vectors keyed by original segment order.",
+    "prepare_total": [0.5493, 0.5141, 0.5076],
+    "arrangement": [0.2769, 0.2492, 0.2535],
+    "classification": [0.1899, 0.1949, 0.1793],
+    "path_build": [0.0824, 0.0698, 0.0743],
+    "render_raster": [0.1025, 0.1007, 0.1028],
+    "attribution_sample": {
+      "pair_stats": {
+        "cells": 856350,
+        "dense_candidates": 4519211,
+        "ordered_candidates": 4519211,
+        "duplicates": 2045859,
+        "overlaps": 1162169
+      },
+      "split_stats": {
+        "segments": 102833,
+        "raw_points": 272946,
+        "unique_points": 228466,
+        "duplicates": 44480,
+        "max_points_per_segment": 95
+      },
+      "arrangement_pairs": 0.0799,
+      "arrangement_finalize": 0.1081,
+      "arrangement": 0.2870,
+      "classification": 0.1932,
+      "path_build": 0.0857,
+      "prepare_total": 0.5661,
+      "render_raster": 0.1024
+    }
+  },
+  "iteration_2": {
+    "change": "Precompute group segment indices during input construction and reuse them in finalize instead of rebuilding the segment-index map.",
+    "prepare_total": [0.5497, 0.4867, 0.4816],
+    "arrangement": [0.2808, 0.2386, 0.2376],
+    "classification": [0.1964, 0.1877, 0.1737],
+    "path_build": [0.0724, 0.0598, 0.0697],
+    "render_raster": [0.1076, 0.1006, 0.1025],
+    "attribution_sample": {
+      "pair_stats": {
+        "cells": 856350,
+        "dense_candidates": 4519211,
+        "ordered_candidates": 4519211,
+        "duplicates": 2045859,
+        "overlaps": 1162169
+      },
+      "split_stats": {
+        "segments": 102833,
+        "raw_points": 272946,
+        "unique_points": 228466,
+        "duplicates": 44480,
+        "max_points_per_segment": 95
+      },
+      "arrangement_pairs": 0.0798,
+      "arrangement_finalize": 0.0780,
+      "arrangement": 0.2845,
+      "classification": 0.1953,
+      "path_build": 0.0755,
+      "prepare_total": 0.5554,
+      "render_raster": 0.1050
+    }
+  },
+  "final_validation": {
+    "prepare_total": [0.5728, 0.5491, 0.5315],
+    "arrangement": [0.2816, 0.2698, 0.2637],
+    "classification": [0.2091, 0.2053, 0.1974],
+    "path_build": [0.0815, 0.0734, 0.0699],
+    "render_raster": [0.1129, 0.1192, 0.1122]
+  },
+  "comparison": {
+    "prepare_total_mean_baseline": 0.5677666667,
+    "prepare_total_mean_best_post_change": 0.506,
+    "prepare_total_mean_final_validation": 0.5511333333,
+    "prepare_total_abs_final_validation": -0.0166333333,
+    "prepare_total_pct_final_validation": -2.929607233,
+    "arrangement_mean_baseline": 0.2892333333,
+    "arrangement_mean_final_validation": 0.2717,
+    "arrangement_abs_final_validation": -0.0175333333,
+    "arrangement_pct_final_validation": -6.0620029964,
+    "classification_mean_baseline": 0.1959666667,
+    "classification_mean_final_validation": 0.2039333333,
+    "classification_abs_final_validation": 0.0079666667,
+    "classification_pct_final_validation": 4.0653172308,
+    "path_build_mean_baseline": 0.0823,
+    "path_build_mean_final_validation": 0.0749333333,
+    "path_build_abs_final_validation": -0.0073666667,
+    "path_build_pct_final_validation": -8.9509923046,
+    "render_raster_mean_baseline": 0.1042666667,
+    "render_raster_mean_final_validation": 0.1147666667,
+    "render_raster_abs_final_validation": 0.0105,
+    "render_raster_pct_final_validation": 10.0703324808
+  }
+}
