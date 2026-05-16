@@ -16,6 +16,10 @@ from maya import (
     mel,
 )
 from maya.api import OpenMaya as om
+try:
+    from maya import OpenMayaUI as omui
+except Exception:
+    omui = None  # type: ignore
 
 import uv_snapshot_edge_drawer as drawer
 
@@ -51,6 +55,9 @@ EDGE_APPEARANCE_SPECS = [
     ("fold",     "Fold Edge",     (0.75, 0.75, 0.0), 2),
 ]
 PREVIEW_MAX_DIMENSION = 512
+PREVIEW_DEFAULT_DISPLAY_SCALE = 0.5
+PREVIEW_MIN_DISPLAY_SCALE = 0.25
+PREVIEW_MAX_DISPLAY_SCALE = 2.0
 WARNING_COLOR = (1.0, 0.43, 0.05)
 WARNING_WIDTH = 16
 ISLAND_FILL_OPACITY = 25
@@ -61,12 +68,24 @@ PREVIEW_FRAME_LABEL = "Preview"
 
 
 try:
-    from PySide6 import QtCore  # type: ignore
+    from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
+    from shiboken6 import wrapInstance  # type: ignore
 except Exception:
     try:
-        from PySide2 import QtCore  # type: ignore
+        from PySide2 import QtCore, QtGui, QtWidgets  # type: ignore
+        from shiboken2 import wrapInstance  # type: ignore
     except Exception:
         QtCore = None  # type: ignore
+        QtGui = None  # type: ignore
+        QtWidgets = None  # type: ignore
+        wrapInstance = None  # type: ignore
+
+
+_preview_display_scale = PREVIEW_DEFAULT_DISPLAY_SCALE
+_preview_image_size = (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION)
+_preview_image_path = None
+_preview_image_label = None
+_preview_wheel_filter = None
 
 
 class AsyncPreviewController(object):
@@ -280,6 +299,31 @@ class AsyncPreviewController(object):
 _preview_refresh_controller = None
 
 
+class PreviewWheelZoomFilter(QtCore.QObject if QtCore is not None else object):
+    """Handle Ctrl+wheel preview display zoom when Qt is available."""
+
+    def eventFilter(self, widget, event):
+        # type: (Any, Any) -> bool
+        del widget
+        if QtCore is None:
+            return False
+        if event.type() != QtCore.QEvent.Wheel:
+            return False
+        if not (event.modifiers() & QtCore.Qt.ControlModifier):
+            return False
+
+        try:
+            delta = event.angleDelta().y()
+        except AttributeError:
+            delta = event.delta()
+        if delta == 0:
+            return False
+
+        _set_preview_display_scale(_preview_display_scale * (1.1 if delta > 0 else 1.0 / 1.1))
+        event.accept()
+        return True
+
+
 def _get_preview_refresh_controller():
     # type: () -> AsyncPreviewController
     global _preview_refresh_controller
@@ -302,10 +346,13 @@ def _process_async_preview_controller():
 
 def _close_async_preview_controller():
     # type: () -> None
-    global _preview_refresh_controller
+    global _preview_refresh_controller, _preview_wheel_filter, _preview_image_label, _preview_image_path
     if _preview_refresh_controller is not None:
         _preview_refresh_controller.close()
         _preview_refresh_controller = None
+    _preview_wheel_filter = None
+    _preview_image_label = None
+    _preview_image_path = None
 
 
 def _edge_control_name(edge_key, suffix):
@@ -937,6 +984,7 @@ def _get_preview_dimensions(settings):
 def _set_preview_placeholder(message):
     # type: (Text) -> None
     cmds.frameLayout("previewFrame", edit=True, label=PREVIEW_FRAME_LABEL)
+    _set_qt_preview_visible(False)
     cmds.image("previewImage", edit=True, visible=False, image="")
     cmds.text("previewStatus", edit=True, visible=True, label=message)
 
@@ -944,20 +992,182 @@ def _set_preview_placeholder(message):
 def _set_preview_busy(message):
     # type: (Text) -> None
     cmds.frameLayout("previewFrame", edit=True, label="{} ({})".format(PREVIEW_FRAME_LABEL, message))
+    _set_qt_preview_visible(False)
+    cmds.image("previewImage", edit=True, visible=False)
     cmds.text("previewStatus", edit=True, visible=False)
+
+
+def _preview_display_dimensions():
+    # type: () -> Tuple[int, int]
+    width, height = _preview_image_size
+    scale = max(PREVIEW_MIN_DISPLAY_SCALE, min(PREVIEW_MAX_DISPLAY_SCALE, float(_preview_display_scale)))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _preview_actual_viewport_dimensions():
+    # type: () -> Tuple[int, int]
+    parent = _qt_widget_from_control("previewViewportLayout")
+    if parent is not None:
+        try:
+            width = int(parent.width())
+            height = int(parent.height())
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            pass
+
+    return _preview_display_dimensions()
+
+
+def _apply_preview_display_size(refresh_pixmap=True):
+    # type: (bool) -> None
+    if not cmds.window("settingsWindow", exists=True):
+        return
+    width, height = _preview_display_dimensions()
+    cmds.frameLayout("previewViewportFrame", edit=True, width=width, height=height)
+    cmds.formLayout("previewViewportLayout", edit=True, width=width, height=height)
+    cmds.image("previewImage", edit=True, width=width, height=height)
+    cmds.text("previewStatus", edit=True, width=width)
+    actual_width, actual_height = _preview_actual_viewport_dimensions()
+    _update_qt_preview_geometry(actual_width, actual_height)
+    if refresh_pixmap:
+        _refresh_qt_preview_pixmap()
+
+
+def _set_preview_display_scale(scale):
+    # type: (float) -> None
+    global _preview_display_scale
+    _preview_display_scale = max(PREVIEW_MIN_DISPLAY_SCALE, min(PREVIEW_MAX_DISPLAY_SCALE, float(scale)))
+    _apply_preview_display_size()
+
+
+def _qt_keep_aspect_ratio_mode():
+    # type: () -> Any
+    return getattr(getattr(QtCore.Qt, "AspectRatioMode", QtCore.Qt), "KeepAspectRatio")
+
+
+def _qt_smooth_transformation_mode():
+    # type: () -> Any
+    return getattr(getattr(QtCore.Qt, "TransformationMode", QtCore.Qt), "SmoothTransformation")
+
+
+def _qt_center_alignment():
+    # type: () -> Any
+    return getattr(getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt), "AlignCenter")
+
+
+def _qt_device_pixel_ratio(widget):
+    # type: (Any) -> float
+    for attr_name in ("devicePixelRatioF", "devicePixelRatio"):
+        ratio_fn = getattr(widget, attr_name, None)
+        if ratio_fn is None:
+            continue
+        try:
+            ratio = float(ratio_fn())
+        except Exception:
+            continue
+        if ratio > 0.0:
+            return ratio
+
+    try:
+        window = widget.windowHandle()
+        screen = window.screen() if window is not None else None
+        ratio = float(screen.devicePixelRatio()) if screen is not None else 1.0
+    except Exception:
+        ratio = 1.0
+    return ratio if ratio > 0.0 else 1.0
+
+
+def _ensure_preview_image_label():
+    # type: () -> Any
+    global _preview_image_label, _preview_wheel_filter
+    if _preview_image_label is not None:
+        return _preview_image_label
+    if QtCore is None or QtGui is None or QtWidgets is None:
+        return None
+
+    parent = _qt_widget_from_control("previewViewportLayout")
+    if parent is None:
+        return None
+
+    label = QtWidgets.QLabel(parent)
+    label.setAlignment(_qt_center_alignment())
+    label.setAutoFillBackground(False)
+    label.setVisible(False)
+    if _preview_wheel_filter is None:
+        _preview_wheel_filter = PreviewWheelZoomFilter()
+    label.installEventFilter(_preview_wheel_filter)
+    _preview_image_label = label
+    _update_qt_preview_geometry(*_preview_actual_viewport_dimensions())
+    return _preview_image_label
+
+
+def _update_qt_preview_geometry(width, height):
+    # type: (int, int) -> None
+    if _preview_image_label is None:
+        return
+    _preview_image_label.setGeometry(0, 0, int(width), int(height))
+    _preview_image_label.setFixedSize(int(width), int(height))
+
+
+def _set_qt_preview_visible(visible):
+    # type: (bool) -> None
+    if _preview_image_label is not None:
+        _preview_image_label.setVisible(bool(visible))
+
+
+def _refresh_qt_preview_pixmap():
+    # type: () -> bool
+    if not _preview_image_path or QtGui is None:
+        return False
+    label = _ensure_preview_image_label()
+    if label is None:
+        return False
+
+    pixmap = QtGui.QPixmap(_preview_image_path)
+    if pixmap.isNull():
+        label.setVisible(False)
+        return False
+
+    width, height = _preview_actual_viewport_dimensions()
+    _update_qt_preview_geometry(width, height)
+    device_pixel_ratio = _qt_device_pixel_ratio(label)
+    device_width = max(1, int(round(width * device_pixel_ratio)))
+    device_height = max(1, int(round(height * device_pixel_ratio)))
+    scaled = pixmap.scaled(
+        device_width,
+        device_height,
+        _qt_keep_aspect_ratio_mode(),
+        _qt_smooth_transformation_mode(),
+    )
+    if hasattr(scaled, "setDevicePixelRatio"):
+        scaled.setDevicePixelRatio(device_pixel_ratio)
+    label.setPixmap(scaled)
+    label.setVisible(True)
+    label.raise_()
+    return True
 
 
 def _set_preview_image(image_path, width, height):
     # type: (Text, int, int) -> None
+    global _preview_image_size, _preview_image_path
+    _preview_image_size = (max(1, int(width)), max(1, int(height)))
+    _preview_image_path = image_path
+    display_width, display_height = _preview_display_dimensions()
     cmds.frameLayout("previewFrame", edit=True, label=PREVIEW_FRAME_LABEL)
     cmds.text("previewStatus", edit=True, visible=False)
+    _apply_preview_display_size(refresh_pixmap=False)
+    if _refresh_qt_preview_pixmap():
+        cmds.image("previewImage", edit=True, visible=False, image="")
+        return
+
     cmds.image(
         "previewImage",
         edit=True,
         visible=True,
         image=image_path,
-        width=width,
-        height=height,
+        width=display_width,
+        height=display_height,
     )
 
 
@@ -1052,8 +1262,38 @@ def _render_snapshot_to_clipboard(settings, json_data):
             os.unlink(temp_path)
 
 
+def _qt_widget_from_control(control_name):
+    # type: (Text) -> Any
+    if omui is None or QtWidgets is None or wrapInstance is None:
+        return None
+    pointer = omui.MQtUtil.findControl(control_name)
+    if pointer is None:
+        return None
+    return wrapInstance(int(pointer), QtWidgets.QWidget)
+
+
+def _install_preview_wheel_zoom_filter():
+    # type: () -> None
+    global _preview_wheel_filter
+    if QtCore is None:
+        return
+
+    if _preview_wheel_filter is None:
+        _preview_wheel_filter = PreviewWheelZoomFilter()
+
+    for control_name in ("previewViewportLayout", "previewImage", "previewStatus"):
+        widget = _qt_widget_from_control(control_name)
+        if widget is not None:
+            widget.installEventFilter(_preview_wheel_filter)
+
+
 def show_ui():
     # type: () -> None
+    global _preview_display_scale, _preview_image_size, _preview_image_path, _preview_image_label
+    _preview_display_scale = PREVIEW_DEFAULT_DISPLAY_SCALE
+    _preview_image_size = (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION)
+    _preview_image_path = None
+    _preview_image_label = None
 
     gOptionBoxTemplateOffsetText = mel.eval("""$tmp = $gOptionBoxTemplateOffsetText;""")  #  type: int
     gOptionBoxTemplateTextColumnWidth = mel.eval("""$tmp = $gOptionBoxTemplateTextColumnWidth;""")  #  type: int
@@ -1256,7 +1496,7 @@ def show_ui():
     cmds.setParent("..")  # End the frameLayout
 
     # UV Area Settings
-    cmds.frameLayout(label="UV Area Settings", collapsable=True)
+    cmds.frameLayout(label="UV Area Settings", collapsable=True, collapse=True)
     if True:
 
         cmds.radioButtonGrp(
@@ -1330,6 +1570,7 @@ def show_ui():
 
         cmds.setParent("..")  # End the frameLayout
 
+    preview_display_width, preview_display_height = _preview_display_dimensions()
     cmds.frameLayout("previewFrame", label=PREVIEW_FRAME_LABEL, collapsable=True, collapse=False)
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6, columnAttach=("both", 8))
     cmds.rowLayout(
@@ -1342,24 +1583,24 @@ def show_ui():
         "previewViewportFrame",
         labelVisible=False,
         borderVisible=True,
-        width=PREVIEW_MAX_DIMENSION,
-        height=PREVIEW_MAX_DIMENSION,
+        width=preview_display_width,
+        height=preview_display_height,
         marginWidth=0,
         marginHeight=0,
     )
     cmds.formLayout(
         "previewViewportLayout",
-        width=PREVIEW_MAX_DIMENSION,
-        height=PREVIEW_MAX_DIMENSION,
+        width=preview_display_width,
+        height=preview_display_height,
     )
     cmds.text(
         "previewStatus",
         label="Select a mesh to preview",
         align="center",
-        width=PREVIEW_MAX_DIMENSION,
+        width=preview_display_width,
         height=20,
     )
-    cmds.image("previewImage", visible=False, width=PREVIEW_MAX_DIMENSION, height=PREVIEW_MAX_DIMENSION)
+    cmds.image("previewImage", visible=False, width=preview_display_width, height=preview_display_height)
     cmds.formLayout(
         "previewViewportLayout",
         edit=True,
@@ -1414,6 +1655,7 @@ def show_ui():
     uv_snapchot_ctrl_changed()
     cmds.scriptJob(uiDeleted=("settingsWindow", "import uv_snapshot_edge_drawer as drawer; import uv_snapshot_edge_drawer.ui as ui; ui._close_async_preview_controller(); drawer.clear_mesh_topology_cache()"))
     cmds.showWindow(settingsWindow)
+    _install_preview_wheel_zoom_filter()
     schedule_preview_refresh(immediate=True)
 
 
