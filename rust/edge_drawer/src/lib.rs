@@ -3175,11 +3175,7 @@ fn rasterize_overlay_shapes_body(
     }
 }
 
-fn collect_scanline_intersections(
-    contour: &OverlayContour,
-    y: f64,
-    intersections: &mut Vec<f64>,
-) {
+fn collect_scanline_intersections(contour: &OverlayContour, y: f64, intersections: &mut Vec<f64>) {
     if contour.len() < 3 {
         return;
     }
@@ -3187,8 +3183,7 @@ fn collect_scanline_intersections(
     let mut previous = *contour.last().expect("contour is non-empty");
     for &current in contour {
         if (current[1] > y) != (previous[1] > y) {
-            let x = (previous[0] - current[0]) * (y - current[1])
-                / (previous[1] - current[1])
+            let x = (previous[0] - current[0]) * (y - current[1]) / (previous[1] - current[1])
                 + current[0];
             intersections.push(x);
         }
