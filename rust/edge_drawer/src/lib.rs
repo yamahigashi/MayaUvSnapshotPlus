@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use i_overlay::core::fill_rule::FillRule as OverlayFillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::overlay::FloatOverlay;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use serde::Deserialize;
@@ -12,10 +15,17 @@ use svg::node::element::path::Data;
 use svg::node::element::Path as SvgPath;
 use svg::Document;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PremultipliedColorU8, Stroke,
+    Transform,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
+type FillContour = Vec<QPoint>;
+type FillShape = Vec<FillContour>;
+type OverlayPoint = [f64; 2];
+type OverlayContour = Vec<OverlayPoint>;
+type OverlayShape = Vec<OverlayContour>;
+type OverlayShapes = Vec<OverlayShape>;
 
 const QUANTIZE_SCALE: f32 = 1_000.0;
 const SAMPLE_EPSILON: f32 = 1e-4;
@@ -156,7 +166,15 @@ struct PreparedDrawing {
 struct PreparedFill {
     fill_color: [u8; 4],
     padding_pixels: f32,
-    paths: Vec<Vec<QPoint>>,
+    shapes: Vec<FillShape>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OverlayBounds {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -508,7 +526,7 @@ fn prepare_drawing(
     log_profile("warning", warning_started_at);
 
     let fill_started_at = Instant::now();
-    let fills = build_island_fills(polygons, island_fill);
+    let fills = build_island_fills(polygons, island_fill, width, height);
     log_profile("island_fill", fill_started_at);
 
     let path_started_at = Instant::now();
@@ -575,7 +593,12 @@ fn prepare_drawing_from_compact(
     log_profile("warning", warning_started_at);
 
     let fill_started_at = Instant::now();
-    let fills = build_island_fills(&payload.polygons, payload.island_fill.as_ref());
+    let fills = build_island_fills(
+        &payload.polygons,
+        payload.island_fill.as_ref(),
+        width,
+        height,
+    );
     log_profile("island_fill", fill_started_at);
 
     let path_started_at = Instant::now();
@@ -1201,6 +1224,8 @@ fn materialize_style_buckets(
 fn build_island_fills(
     polygons: &[Polygon],
     island_fill: Option<&IslandFillConfig>,
+    width: u32,
+    height: u32,
 ) -> Vec<PreparedFill> {
     let Some(island_fill) = island_fill else {
         return Vec::new();
@@ -1216,139 +1241,244 @@ fn build_island_fills(
     let alpha = (opacity * 255.0).round() as u8;
     let padding_pixels = island_fill.padding_pixels.max(0.0);
 
-    let Some(arrangement) = build_polygon_boundary_arrangement(polygons) else {
-        return Vec::new();
-    };
-    let (_internal_segments, outline_segments) = classify_segments(
-        &arrangement.segments,
-        &arrangement.point_positions,
-        polygons,
-    );
-    fills_from_outline_segments(
-        &outline_segments,
-        &arrangement.point_positions,
-        alpha,
-        padding_pixels,
-    )
+    build_island_fills_from_polygons(polygons, alpha, padding_pixels, width, height)
 }
 
-fn build_polygon_boundary_arrangement(polygons: &[Polygon]) -> Option<SegmentArrangement> {
-    let mut point_positions = HashMap::new();
-    let mut original_segments = Vec::new();
-    let mut original_segment_set = HashSet::new();
-
-    for polygon in polygons {
-        let Some(path) = quantized_polygon_path(polygon) else {
-            continue;
-        };
-        for &position in &polygon.points {
-            point_positions
-                .entry(quantize_point(position))
-                .or_insert(position);
-        }
-        for segment in polygon_path_edges(&path) {
-            if original_segment_set.insert(segment) {
-                original_segments.push(segment);
-            }
-        }
-    }
-
-    if original_segments.is_empty() {
-        return None;
-    }
-
-    original_segments.sort_by_key(|segment| (segment.start, segment.end));
-    let group_segments = vec![original_segments.clone()];
-    let group_segment_indices = vec![(0..original_segments.len()).collect::<Vec<_>>()];
-    Some(build_segment_arrangement_from_parts(
-        original_segments,
-        Arc::new(point_positions),
-        &group_segments,
-        &group_segment_indices,
-    ))
-}
-
-fn fills_from_outline_segments(
-    outline_segments: &HashSet<CanonicalSegment>,
-    point_positions: &PointPositionIndex,
+fn build_island_fills_from_polygons(
+    polygons: &[Polygon],
     alpha: u8,
     padding_pixels: f32,
+    width: u32,
+    height: u32,
 ) -> Vec<PreparedFill> {
-    if outline_segments.is_empty() {
+    let overlay_shapes = polygons_to_overlay_shapes(polygons, width, height);
+    if overlay_shapes.is_empty() {
         return Vec::new();
     }
 
-    let mut sorted_segments = outline_segments.iter().copied().collect::<Vec<_>>();
-    sorted_segments.sort_by_key(|segment| (segment.start, segment.end));
-    let adjacency = build_adjacency(&sorted_segments, point_positions);
-    let component_map = compute_components(&adjacency);
-    let mut component_order = Vec::new();
-    let mut component_segments = HashMap::<usize, Vec<SegmentInfo>>::new();
+    let mut overlay = FloatOverlay::with_subj(&overlay_shapes);
+    let mut union_shapes = overlay.overlay(OverlayRule::Subject, OverlayFillRule::NonZero);
+    union_shapes.sort_by(|left, right| {
+        let left_bounds = overlay_shape_bounds(left);
+        let right_bounds = overlay_shape_bounds(right);
+        compare_overlay_shape_bounds(left_bounds, right_bounds)
+    });
 
-    for segment in sorted_segments {
-        let component_id = component_map
-            .get(&segment.start)
-            .copied()
-            .unwrap_or_default();
-        if !component_segments.contains_key(&component_id) {
-            component_order.push(component_id);
-            component_segments.insert(component_id, Vec::new());
-        }
-        component_segments
-            .get_mut(&component_id)
-            .expect("component segment bucket must exist")
-            .push(segment_from_canonical(segment));
-    }
-
-    let mut fills = Vec::new();
-    for component_id in component_order {
-        let Some(segments) = component_segments.remove(&component_id) else {
+    let mut fills = Vec::with_capacity(union_shapes.len());
+    for shape in union_shapes {
+        let Some(fill_shape) = overlay_shape_to_fill_shape(&shape, width, height) else {
             continue;
         };
-        let paths = build_paths_from_segments(&segments)
-            .into_iter()
-            .filter(|path| path.len() >= 3 && path.first() == path.last())
-            .collect::<Vec<_>>();
-        if paths.is_empty() {
+        if fill_shape.is_empty() {
             continue;
         }
         let fill_index = fills.len();
         fills.push(PreparedFill {
             fill_color: island_fill_color(fill_index, alpha),
             padding_pixels,
-            paths,
+            shapes: vec![fill_shape],
         });
     }
 
     fills
 }
 
-fn quantized_polygon_path(polygon: &Polygon) -> Option<Vec<QPoint>> {
-    if polygon.points.len() < 3 {
-        return None;
-    }
-
-    let mut path = Vec::with_capacity(polygon.points.len() + 1);
-    for &point in &polygon.points {
-        let quantized = quantize_point(point);
-        if path.last().copied() == Some(quantized) {
-            continue;
-        }
-        path.push(quantized);
-    }
-    if path.len() >= 3 && path.first() == path.last() {
-        path.pop();
-    }
-    if path.len() < 3 {
-        return None;
-    }
-    path.push(path[0]);
-    Some(path)
+fn polygons_to_overlay_shapes(polygons: &[Polygon], width: u32, height: u32) -> OverlayShapes {
+    polygons
+        .iter()
+        .filter_map(|polygon| polygon_to_overlay_shape(polygon, width, height))
+        .collect()
 }
 
-fn polygon_path_edges(path: &[QPoint]) -> impl Iterator<Item = CanonicalSegment> + '_ {
-    path.windows(2)
-        .filter_map(|points| canonical_segment(points[0], points[1]))
+fn polygon_to_overlay_shape(polygon: &Polygon, width: u32, height: u32) -> Option<OverlayShape> {
+    let contour = polygon_to_overlay_contour(polygon, width, height)?;
+    Some(vec![contour])
+}
+
+fn polygon_to_overlay_contour(
+    polygon: &Polygon,
+    width: u32,
+    height: u32,
+) -> Option<OverlayContour> {
+    if polygon.points.len() < 3 || width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut contour = Vec::with_capacity(polygon.points.len());
+    for &point in &polygon.points {
+        let canvas = uv_to_canvas_point(point, width, height);
+        if contour.last().copied() == Some(canvas) {
+            continue;
+        }
+        contour.push(canvas);
+    }
+    if contour.len() >= 3 && contour.first() == contour.last() {
+        contour.pop();
+    }
+    if contour.len() < 3 {
+        return None;
+    }
+    if overlay_contour_area(&contour) < 0.0 {
+        contour.reverse();
+    }
+    Some(contour)
+}
+
+fn overlay_shapes_bounds(shapes: &OverlayShapes) -> Option<OverlayBounds> {
+    let mut bounds: Option<OverlayBounds> = None;
+    for shape in shapes {
+        for contour in shape {
+            for point in contour {
+                bounds = Some(match bounds {
+                    Some(current) => OverlayBounds {
+                        min_x: current.min_x.min(point[0]),
+                        min_y: current.min_y.min(point[1]),
+                        max_x: current.max_x.max(point[0]),
+                        max_y: current.max_y.max(point[1]),
+                    },
+                    None => OverlayBounds {
+                        min_x: point[0],
+                        min_y: point[1],
+                        max_x: point[0],
+                        max_y: point[1],
+                    },
+                });
+            }
+        }
+    }
+    bounds
+}
+
+fn overlay_shape_bounds(shape: &OverlayShape) -> Option<OverlayBounds> {
+    let mut bounds: Option<OverlayBounds> = None;
+    for contour in shape {
+        for point in contour {
+            bounds = Some(match bounds {
+                Some(current) => OverlayBounds {
+                    min_x: current.min_x.min(point[0]),
+                    min_y: current.min_y.min(point[1]),
+                    max_x: current.max_x.max(point[0]),
+                    max_y: current.max_y.max(point[1]),
+                },
+                None => OverlayBounds {
+                    min_x: point[0],
+                    min_y: point[1],
+                    max_x: point[0],
+                    max_y: point[1],
+                },
+            });
+        }
+    }
+    bounds
+}
+
+fn compare_overlay_shape_bounds(
+    left: Option<OverlayBounds>,
+    right: Option<OverlayBounds>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .min_y
+            .total_cmp(&right.min_y)
+            .then_with(|| left.min_x.total_cmp(&right.min_x))
+            .then_with(|| left.max_y.total_cmp(&right.max_y))
+            .then_with(|| left.max_x.total_cmp(&right.max_x)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn fill_shapes_to_overlay_shapes(shapes: &[FillShape], width: u32, height: u32) -> OverlayShapes {
+    shapes
+        .iter()
+        .filter_map(|shape| fill_shape_to_overlay_shape(shape, width, height))
+        .collect()
+}
+
+fn fill_shape_to_overlay_shape(shape: &FillShape, width: u32, height: u32) -> Option<OverlayShape> {
+    let contours = shape
+        .iter()
+        .filter_map(|contour| fill_contour_to_overlay_contour(contour, width, height))
+        .collect::<Vec<_>>();
+    if contours.is_empty() {
+        None
+    } else {
+        Some(contours)
+    }
+}
+
+fn fill_contour_to_overlay_contour(
+    contour: &[QPoint],
+    width: u32,
+    height: u32,
+) -> Option<OverlayContour> {
+    if contour.len() < 4 || contour.first() != contour.last() {
+        return None;
+    }
+
+    let mut overlay = contour[..contour.len() - 1]
+        .iter()
+        .map(|point| {
+            let canvas = to_canvas_point(*point, width, height);
+            [canvas[0] as f64, canvas[1] as f64]
+        })
+        .collect::<Vec<_>>();
+    overlay.dedup_by(|left, right| {
+        (left[0] - right[0]).abs() < f64::EPSILON && (left[1] - right[1]).abs() < f64::EPSILON
+    });
+    if overlay.len() < 3 {
+        return None;
+    }
+    if overlay_contour_area(&overlay) < 0.0 {
+        overlay.reverse();
+    }
+    Some(overlay)
+}
+
+fn overlay_shape_to_fill_shape(shape: &OverlayShape, width: u32, height: u32) -> Option<FillShape> {
+    let contours = shape
+        .iter()
+        .filter_map(|contour| overlay_contour_to_fill_contour(contour, width, height))
+        .collect::<Vec<_>>();
+    if contours.is_empty() {
+        None
+    } else {
+        Some(contours)
+    }
+}
+
+fn overlay_contour_to_fill_contour(
+    contour: &OverlayContour,
+    width: u32,
+    height: u32,
+) -> Option<FillContour> {
+    let mut fill_contour = contour
+        .iter()
+        .map(|point| QPoint {
+            x: ((point[0] / width as f64) * QUANTIZE_SCALE as f64).round() as i64,
+            y: (((height as f64 - point[1]) / height as f64) * QUANTIZE_SCALE as f64).round()
+                as i64,
+        })
+        .collect::<Vec<_>>();
+    fill_contour.dedup();
+    if fill_contour.len() < 3 {
+        return None;
+    }
+    if fill_contour.first() != fill_contour.last() {
+        fill_contour.push(fill_contour[0]);
+    }
+    Some(fill_contour)
+}
+
+fn overlay_contour_area(contour: &OverlayContour) -> f64 {
+    let mut area = 0.0;
+    for idx in 0..contour.len() {
+        let current = contour[idx];
+        let next = contour[(idx + 1) % contour.len()];
+        area += current[0] * next[1] - next[0] * current[1];
+    }
+    area * 0.5
 }
 
 fn island_fill_color(index: usize, alpha: u8) -> [u8; 4] {
@@ -2711,7 +2841,7 @@ fn draw_edges_svg(prepared: &PreparedDrawing, width: u32, height: u32) -> Docume
     let mut document = Document::new().set("viewBox", (0, 0, width, height));
 
     for fill in &prepared.fills {
-        if fill.paths.is_empty() {
+        if fill.shapes.is_empty() {
             continue;
         }
 
@@ -2721,8 +2851,8 @@ fn draw_edges_svg(prepared: &PreparedDrawing, width: u32, height: u32) -> Docume
         );
         let opacity = fill.fill_color[3] as f32 / 255.0;
 
-        for path in &fill.paths {
-            let Some(data) = svg_path_data(path, width, height) else {
+        for shape in &fill.shapes {
+            let Some(data) = svg_shape_data(shape, width, height) else {
                 continue;
             };
 
@@ -2770,6 +2900,35 @@ fn draw_edges_svg(prepared: &PreparedDrawing, width: u32, height: u32) -> Docume
     document
 }
 
+fn svg_shape_data(shape: &FillShape, width: u32, height: u32) -> Option<Data> {
+    let mut data = Data::new();
+    let mut has_contour = false;
+
+    for contour in shape {
+        let Some(first) = contour.first() else {
+            continue;
+        };
+        let first_point = to_canvas_point(*first, width, height);
+        data = data.move_to((first_point[0] as f64, first_point[1] as f64));
+
+        for point in &contour[1..] {
+            let canvas = to_canvas_point(*point, width, height);
+            data = data.line_to((canvas[0] as f64, canvas[1] as f64));
+        }
+
+        if contour.len() >= 3 && contour.first() == contour.last() {
+            data = data.close();
+        }
+        has_contour = true;
+    }
+
+    if has_contour {
+        Some(data)
+    } else {
+        None
+    }
+}
+
 fn svg_path_data(path: &[QPoint], width: u32, height: u32) -> Option<Data> {
     let first = path.first()?;
     let first_point = to_canvas_point(*first, width, height);
@@ -2795,8 +2954,16 @@ fn draw_edges_raster(
     let mut pixmap =
         Pixmap::new(width, height).ok_or_else(|| "failed to allocate raster pixmap".to_string())?;
 
+    let use_distance_field_fill = prepared.fills.iter().any(|fill| fill.padding_pixels > 0.0);
+    if use_distance_field_fill {
+        draw_island_fill_distance_field_raster(&mut pixmap, &prepared.fills, width, height);
+    }
+
     for fill in &prepared.fills {
-        if fill.paths.is_empty() {
+        if use_distance_field_fill && fill.padding_pixels > 0.0 {
+            continue;
+        }
+        if fill.shapes.is_empty() {
             continue;
         }
 
@@ -2808,8 +2975,8 @@ fn draw_edges_raster(
             fill.fill_color[3],
         ));
 
-        for path in &fill.paths {
-            let Some(sk_path) = build_skia_path(path, width, height) else {
+        for shape in &fill.shapes {
+            let Some(sk_path) = build_skia_shape(shape, width, height) else {
                 continue;
             };
             pixmap.fill_path(
@@ -2819,15 +2986,6 @@ fn draw_edges_raster(
                 Transform::identity(),
                 None,
             );
-            if fill.padding_pixels > 0.0 {
-                let stroke = Stroke {
-                    width: (fill.padding_pixels * 2.0).max(0.5),
-                    line_cap: LineCap::Round,
-                    line_join: LineJoin::Round,
-                    ..Stroke::default()
-                };
-                pixmap.stroke_path(&sk_path, &paint, &stroke, Transform::identity(), None);
-            }
         }
     }
 
@@ -2860,6 +3018,233 @@ fn draw_edges_raster(
     }
 
     Ok(pixmap)
+}
+
+fn draw_island_fill_distance_field_raster(
+    pixmap: &mut Pixmap,
+    fills: &[PreparedFill],
+    width: u32,
+    height: u32,
+) {
+    if fills.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    if !fills.iter().any(|fill| fill.padding_pixels > 0.0) {
+        return;
+    }
+
+    let fill_shapes = fills
+        .iter()
+        .map(|fill| fill_shapes_to_overlay_shapes(&fill.shapes, width, height))
+        .collect::<Vec<_>>();
+    let fill_bounds = fill_shapes
+        .iter()
+        .map(|shapes| overlay_shapes_bounds(shapes))
+        .collect::<Vec<_>>();
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut body_mask = vec![false; pixel_count];
+    let mut owner_distances = vec![f64::INFINITY; pixel_count];
+    let mut owner_indices = vec![usize::MAX; pixel_count];
+
+    for (fill_index, shapes) in fill_shapes.iter().enumerate() {
+        let Some(bounds) = fill_bounds[fill_index] else {
+            continue;
+        };
+        let (min_x, max_x, min_y, max_y) = pixel_range_for_bounds(bounds, 0.0, width, height);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let point = pixel_center(x, y);
+                if point_in_overlay_shapes(point, shapes) {
+                    let index = pixel_index(x, y, width);
+                    body_mask[index] = true;
+                    owner_distances[index] = -1.0;
+                    owner_indices[index] = fill_index;
+                }
+            }
+        }
+    }
+
+    for (fill_index, fill) in fills.iter().enumerate() {
+        let padding_pixels = fill.padding_pixels.max(0.0) as f64;
+        if padding_pixels <= 0.0 {
+            continue;
+        }
+        let Some(bounds) = fill_bounds[fill_index] else {
+            continue;
+        };
+        let padding_squared = padding_pixels * padding_pixels;
+        let (min_x, max_x, min_y, max_y) =
+            pixel_range_for_bounds(bounds, padding_pixels, width, height);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let index = pixel_index(x, y, width);
+                if body_mask[index] {
+                    continue;
+                }
+                let point = pixel_center(x, y);
+                let distance = distance_to_overlay_shapes_squared(point, &fill_shapes[fill_index]);
+                if distance <= padding_squared && distance < owner_distances[index] {
+                    owner_distances[index] = distance;
+                    owner_indices[index] = fill_index;
+                }
+            }
+        }
+    }
+
+    let pixels = pixmap.pixels_mut();
+    for (index, owner_index) in owner_indices.into_iter().enumerate() {
+        if owner_index == usize::MAX {
+            continue;
+        }
+        source_over_pixel(&mut pixels[index], fills[owner_index].fill_color);
+    }
+}
+
+fn pixel_range_for_bounds(
+    bounds: OverlayBounds,
+    expand: f64,
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let max_x_limit = width.saturating_sub(1) as f64;
+    let max_y_limit = height.saturating_sub(1) as f64;
+    let min_x = (bounds.min_x - expand).floor().clamp(0.0, max_x_limit) as u32;
+    let max_x = (bounds.max_x + expand).ceil().clamp(0.0, max_x_limit) as u32;
+    let min_y = (bounds.min_y - expand).floor().clamp(0.0, max_y_limit) as u32;
+    let max_y = (bounds.max_y + expand).ceil().clamp(0.0, max_y_limit) as u32;
+    (min_x, max_x, min_y, max_y)
+}
+
+fn pixel_center(x: u32, y: u32) -> OverlayPoint {
+    [x as f64 + 0.5, y as f64 + 0.5]
+}
+
+fn pixel_index(x: u32, y: u32, width: u32) -> usize {
+    y as usize * width as usize + x as usize
+}
+
+fn point_in_overlay_shapes(point: OverlayPoint, shapes: &OverlayShapes) -> bool {
+    shapes.iter().any(|shape| {
+        shape.iter().fold(false, |inside, contour| {
+            inside ^ point_in_overlay_contour(point, contour)
+        })
+    })
+}
+
+fn point_in_overlay_contour(point: OverlayPoint, contour: &OverlayContour) -> bool {
+    if contour.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = *contour.last().expect("contour is non-empty");
+    for &current in contour {
+        let intersects = ((current[1] > point[1]) != (previous[1] > point[1]))
+            && (point[0]
+                < (previous[0] - current[0]) * (point[1] - current[1])
+                    / (previous[1] - current[1])
+                    + current[0]);
+        if intersects {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn distance_to_overlay_shapes_squared(point: OverlayPoint, shapes: &OverlayShapes) -> f64 {
+    let mut best = f64::INFINITY;
+    for shape in shapes {
+        for contour in shape {
+            best = best.min(distance_to_overlay_contour_squared(point, contour));
+        }
+    }
+    best
+}
+
+fn distance_to_overlay_contour_squared(point: OverlayPoint, contour: &OverlayContour) -> f64 {
+    if contour.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut best = f64::INFINITY;
+    for index in 0..contour.len() {
+        let start = contour[index];
+        let end = contour[(index + 1) % contour.len()];
+        best = best.min(distance_to_segment_squared(point, start, end));
+    }
+    best
+}
+
+fn distance_to_segment_squared(point: OverlayPoint, start: OverlayPoint, end: OverlayPoint) -> f64 {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f64::EPSILON {
+        return squared_distance(point, start);
+    }
+    let t = (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared)
+        .clamp(0.0, 1.0);
+    squared_distance(point, [start[0] + dx * t, start[1] + dy * t])
+}
+
+fn squared_distance(left: OverlayPoint, right: OverlayPoint) -> f64 {
+    let dx = left[0] - right[0];
+    let dy = left[1] - right[1];
+    dx * dx + dy * dy
+}
+
+fn source_over_pixel(pixel: &mut PremultipliedColorU8, color: [u8; 4]) {
+    let src_a = color[3] as u16;
+    if src_a == 0 {
+        return;
+    }
+    let inv_src_a = 255u16.saturating_sub(src_a);
+    let src_r = premultiply_channel(color[0], color[3]);
+    let src_g = premultiply_channel(color[1], color[3]);
+    let src_b = premultiply_channel(color[2], color[3]);
+    let out_r = src_r as u16 + (pixel.red() as u16 * inv_src_a + 127) / 255;
+    let out_g = src_g as u16 + (pixel.green() as u16 * inv_src_a + 127) / 255;
+    let out_b = src_b as u16 + (pixel.blue() as u16 * inv_src_a + 127) / 255;
+    let out_a = src_a + (pixel.alpha() as u16 * inv_src_a + 127) / 255;
+    *pixel = PremultipliedColorU8::from_rgba(
+        out_r.min(255) as u8,
+        out_g.min(255) as u8,
+        out_b.min(255) as u8,
+        out_a.min(255) as u8,
+    )
+    .expect("source-over premultiplied color must be valid");
+}
+
+fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
+    ((channel as u16 * alpha as u16 + 127) / 255) as u8
+}
+
+fn build_skia_shape(shape: &FillShape, width: u32, height: u32) -> Option<tiny_skia::Path> {
+    let mut builder = PathBuilder::new();
+    let mut has_contour = false;
+
+    for contour in shape {
+        let Some(first) = contour.first().copied() else {
+            continue;
+        };
+        let first_point = to_canvas_point(first, width, height);
+        builder.move_to(first_point[0], first_point[1]);
+
+        for point in &contour[1..] {
+            let canvas = to_canvas_point(*point, width, height);
+            builder.line_to(canvas[0], canvas[1]);
+        }
+
+        if contour.len() >= 3 && contour.first() == contour.last() {
+            builder.close();
+        }
+        has_contour = true;
+    }
+
+    if has_contour {
+        builder.finish()
+    } else {
+        None
+    }
 }
 
 fn build_skia_path(path: &[QPoint], width: u32, height: u32) -> Option<tiny_skia::Path> {
@@ -2965,6 +3350,13 @@ fn to_canvas_point(point: QPoint, width: u32, height: u32) -> [f32; 2] {
         point.y as f32 / QUANTIZE_SCALE,
     ];
     [uv[0] * width as f32, (1.0 - uv[1]) * height as f32]
+}
+
+fn uv_to_canvas_point(point: [f32; 2], width: u32, height: u32) -> OverlayPoint {
+    [
+        point[0] as f64 * width as f64,
+        (1.0 - point[1] as f64) * height as f64,
+    ]
 }
 
 fn compact_payload_from_buffers(
@@ -3709,8 +4101,8 @@ mod tests {
 
         assert_eq!(prepared.fills.len(), 2);
         assert_eq!(prepared.fills[0].fill_color[3], 64);
-        assert_eq!(prepared.fills[0].paths.len(), 1);
-        assert_eq!(prepared.fills[1].paths.len(), 1);
+        assert_eq!(prepared.fills[0].shapes.len(), 1);
+        assert_eq!(prepared.fills[1].shapes.len(), 1);
     }
 
     #[test]
@@ -3730,14 +4122,187 @@ mod tests {
                 opacity: 0.25,
                 padding_pixels: 0.0,
             }),
+            128,
+            128,
         );
 
         assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].paths.len(), 1);
-        assert!(!fills[0].paths[0].windows(2).any(|points| {
+        assert_eq!(fills[0].shapes.len(), 1);
+        assert_eq!(fills[0].shapes[0].len(), 1);
+        assert!(!fills[0].shapes[0][0].windows(2).any(|points| {
             canonical_segment(points[0], points[1])
                 == canonical_segment(quantize_point([0.5, 0.1]), quantize_point([0.5, 0.5]))
         }));
+    }
+
+    #[test]
+    fn test_island_fill_unions_polygon_layout_with_t_junctions() {
+        let polygons = vec![
+            Polygon {
+                points: vec![[0.1, 0.1], [0.9, 0.1], [0.9, 0.4], [0.1, 0.4]],
+            },
+            Polygon {
+                points: vec![[0.4, 0.4], [0.6, 0.4], [0.6, 0.8], [0.4, 0.8]],
+            },
+        ];
+        let fills = build_island_fills(
+            &polygons,
+            Some(&IslandFillConfig {
+                enabled: true,
+                opacity: 0.25,
+                padding_pixels: 0.0,
+            }),
+            128,
+            128,
+        );
+
+        assert_eq!(fills.len(), 1);
+        assert!(point_in_fill_shapes([0.5, 0.7], &fills[0].shapes));
+    }
+
+    #[test]
+    fn test_island_fill_preserves_holes_from_polygon_union() {
+        let polygons = vec![
+            Polygon {
+                points: vec![[0.1, 0.1], [0.9, 0.1], [0.9, 0.3], [0.1, 0.3]],
+            },
+            Polygon {
+                points: vec![[0.1, 0.7], [0.9, 0.7], [0.9, 0.9], [0.1, 0.9]],
+            },
+            Polygon {
+                points: vec![[0.1, 0.3], [0.3, 0.3], [0.3, 0.7], [0.1, 0.7]],
+            },
+            Polygon {
+                points: vec![[0.7, 0.3], [0.9, 0.3], [0.9, 0.7], [0.7, 0.7]],
+            },
+        ];
+        let fills = build_island_fills(
+            &polygons,
+            Some(&IslandFillConfig {
+                enabled: true,
+                opacity: 0.25,
+                padding_pixels: 0.0,
+            }),
+            128,
+            128,
+        );
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].shapes[0].len(), 2);
+        assert!(point_in_fill_shapes([0.2, 0.2], &fills[0].shapes));
+        assert!(!point_in_fill_shapes([0.5, 0.5], &fills[0].shapes));
+    }
+
+    #[test]
+    fn test_island_fill_padding_is_kept_for_raster_distance_field() {
+        let polygons = vec![Polygon {
+            points: vec![[0.2, 0.2], [0.4, 0.2], [0.4, 0.4], [0.2, 0.4]],
+        }];
+        let fills = build_island_fills(
+            &polygons,
+            Some(&IslandFillConfig {
+                enabled: true,
+                opacity: 0.25,
+                padding_pixels: 10.0,
+            }),
+            100,
+            100,
+        );
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].padding_pixels, 10.0);
+        let (min_x, max_x, min_y, max_y) = fill_shapes_bounds(&fills[0].shapes);
+        assert_eq!(min_x, quantize_point([0.2, 0.2]).x);
+        assert_eq!(max_x, quantize_point([0.4, 0.4]).x);
+        assert_eq!(min_y, quantize_point([0.2, 0.2]).y);
+        assert_eq!(max_y, quantize_point([0.4, 0.4]).y);
+    }
+
+    #[test]
+    fn test_raster_island_fill_padding_uses_nearest_island_owner() {
+        let polygons = vec![
+            Polygon {
+                points: vec![[0.2, 0.2], [0.4, 0.2], [0.4, 0.4], [0.2, 0.4]],
+            },
+            Polygon {
+                points: vec![[0.5, 0.2], [0.7, 0.2], [0.7, 0.4], [0.5, 0.4]],
+            },
+        ];
+        let prepared = prepare_drawing(
+            &[],
+            &polygons,
+            100,
+            100,
+            None,
+            Some(&IslandFillConfig {
+                enabled: true,
+                opacity: 0.25,
+                padding_pixels: 10.0,
+            }),
+        );
+        let pixmap = draw_edges_raster(&prepared, 100, 100).unwrap();
+
+        assert_left_island_pixel(&pixmap, 44, 70);
+        assert_right_island_pixel(&pixmap, 46, 70);
+        assert_right_island_pixel(&pixmap, 45, 70);
+    }
+
+    fn fill_shapes_bounds(shapes: &[FillShape]) -> (i64, i64, i64, i64) {
+        let mut min_x = i64::MAX;
+        let mut max_x = i64::MIN;
+        let mut min_y = i64::MAX;
+        let mut max_y = i64::MIN;
+        for shape in shapes {
+            for contour in shape {
+                for point in contour {
+                    min_x = min_x.min(point.x);
+                    max_x = max_x.max(point.x);
+                    min_y = min_y.min(point.y);
+                    max_y = max_y.max(point.y);
+                }
+            }
+        }
+        (min_x, max_x, min_y, max_y)
+    }
+
+    fn point_in_fill_shapes(point: [f32; 2], shapes: &[FillShape]) -> bool {
+        shapes.iter().any(|shape| {
+            shape.iter().fold(false, |inside, contour| {
+                let points = contour
+                    .iter()
+                    .map(|vertex| {
+                        [
+                            vertex.x as f32 / QUANTIZE_SCALE,
+                            vertex.y as f32 / QUANTIZE_SCALE,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                inside ^ point_in_polygon_points(point, &points)
+            })
+        })
+    }
+
+    fn assert_left_island_pixel(pixmap: &Pixmap, x: u32, y: u32) {
+        let color = pixel_color_u8(pixmap, x, y);
+        assert_eq!(color[3], 64);
+        assert!(
+            color[2] > color[0],
+            "expected blue island color, got {color:?}"
+        );
+    }
+
+    fn assert_right_island_pixel(pixmap: &Pixmap, x: u32, y: u32) {
+        let color = pixel_color_u8(pixmap, x, y);
+        assert_eq!(color[3], 64);
+        assert!(
+            color[0] > color[2],
+            "expected orange island color, got {color:?}"
+        );
+    }
+
+    fn pixel_color_u8(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let color = pixmap.pixels()[pixel_index(x, y, pixmap.width())].demultiply();
+        [color.red(), color.green(), color.blue(), color.alpha()]
     }
 
     #[test]
