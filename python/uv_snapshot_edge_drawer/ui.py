@@ -86,6 +86,10 @@ _preview_image_size = (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION)
 _preview_image_path = None
 _preview_image_label = None
 _preview_wheel_filter = None
+_preview_source_pixmap = None
+_preview_source_pixmap_path = None
+_preview_pixmap_refresh_generation = 0
+_previous_island_fill_enabled = False
 
 
 class AsyncPreviewController(object):
@@ -347,12 +351,16 @@ def _process_async_preview_controller():
 def _close_async_preview_controller():
     # type: () -> None
     global _preview_refresh_controller, _preview_wheel_filter, _preview_image_label, _preview_image_path
+    global _preview_source_pixmap, _preview_source_pixmap_path, _preview_pixmap_refresh_generation
     if _preview_refresh_controller is not None:
         _preview_refresh_controller.close()
         _preview_refresh_controller = None
     _preview_wheel_filter = None
     _preview_image_label = None
     _preview_image_path = None
+    _preview_source_pixmap = None
+    _preview_source_pixmap_path = None
+    _preview_pixmap_refresh_generation += 1
 
 
 def _edge_control_name(edge_key, suffix):
@@ -555,6 +563,12 @@ def _get_draw_outline(edge_key):
         query=True,
         value=True,
     )
+
+
+def _set_all_draw_internal(value):
+    # type: (bool) -> None
+    for edge_key, _label, _color, _width in EDGE_APPEARANCE_SPECS:
+        cmds.checkBox(_edge_control_name(edge_key, "DrawInternal"), edit=True, value=bool(value))
 
 
 def _sync_width_from_slider(edge_key, mode, value):
@@ -1038,7 +1052,8 @@ def _set_preview_display_scale(scale):
     # type: (float) -> None
     global _preview_display_scale
     _preview_display_scale = max(PREVIEW_MIN_DISPLAY_SCALE, min(PREVIEW_MAX_DISPLAY_SCALE, float(scale)))
-    _apply_preview_display_size()
+    _apply_preview_display_size(refresh_pixmap=False)
+    _queue_qt_preview_pixmap_refresh()
 
 
 def _qt_keep_aspect_ratio_mode():
@@ -1116,6 +1131,46 @@ def _set_qt_preview_visible(visible):
         _preview_image_label.setVisible(bool(visible))
 
 
+def _queue_qt_preview_pixmap_refresh():
+    # type: () -> None
+    global _preview_pixmap_refresh_generation
+    _preview_pixmap_refresh_generation += 1
+    generation = _preview_pixmap_refresh_generation
+    if QtCore is None:
+        _flush_qt_preview_pixmap_refresh(generation)
+        return
+    QtCore.QTimer.singleShot(
+        0,
+        lambda generation=generation: _flush_qt_preview_pixmap_refresh(generation),
+    )
+
+
+def _flush_qt_preview_pixmap_refresh(generation):
+    # type: (int) -> None
+    if generation != _preview_pixmap_refresh_generation:
+        return
+    if not cmds.window("settingsWindow", exists=True):
+        return
+    _apply_preview_display_size(refresh_pixmap=False)
+    _refresh_qt_preview_pixmap()
+
+
+def _get_preview_source_pixmap():
+    # type: () -> Any
+    global _preview_source_pixmap, _preview_source_pixmap_path
+    if not _preview_image_path or QtGui is None:
+        return None
+    if _preview_source_pixmap_path != _preview_image_path or _preview_source_pixmap is None:
+        pixmap = QtGui.QPixmap(_preview_image_path)
+        if pixmap.isNull():
+            _preview_source_pixmap = None
+            _preview_source_pixmap_path = None
+            return None
+        _preview_source_pixmap = pixmap
+        _preview_source_pixmap_path = _preview_image_path
+    return _preview_source_pixmap
+
+
 def _refresh_qt_preview_pixmap():
     # type: () -> bool
     if not _preview_image_path or QtGui is None:
@@ -1124,7 +1179,10 @@ def _refresh_qt_preview_pixmap():
     if label is None:
         return False
 
-    pixmap = QtGui.QPixmap(_preview_image_path)
+    pixmap = _get_preview_source_pixmap()
+    if pixmap is None:
+        label.setVisible(False)
+        return False
     if pixmap.isNull():
         label.setVisible(False)
         return False
@@ -1150,8 +1208,11 @@ def _refresh_qt_preview_pixmap():
 
 def _set_preview_image(image_path, width, height):
     # type: (Text, int, int) -> None
-    global _preview_image_size, _preview_image_path
+    global _preview_image_size, _preview_image_path, _preview_source_pixmap, _preview_source_pixmap_path
     _preview_image_size = (max(1, int(width)), max(1, int(height)))
+    if image_path != _preview_image_path:
+        _preview_source_pixmap = None
+        _preview_source_pixmap_path = None
     _preview_image_path = image_path
     display_width, display_height = _preview_display_dimensions()
     cmds.frameLayout("previewFrame", edit=True, label=PREVIEW_FRAME_LABEL)
@@ -1197,6 +1258,17 @@ def _render_preview_job(request, preview_path):
 
 def refresh_preview(*args):
     # type: (*Any) -> None
+    schedule_preview_refresh(immediate=True)
+
+
+def _on_island_fill_enabled_changed(*args):
+    # type: (*Any) -> None
+    global _previous_island_fill_enabled
+    enabled = cmds.checkBox("islandFillEnabled", query=True, value=True)
+    if enabled and not _previous_island_fill_enabled:
+        _set_all_draw_internal(False)
+    _previous_island_fill_enabled = enabled
+    update_controls()
     schedule_preview_refresh(immediate=True)
 
 
@@ -1290,10 +1362,16 @@ def _install_preview_wheel_zoom_filter():
 def show_ui():
     # type: () -> None
     global _preview_display_scale, _preview_image_size, _preview_image_path, _preview_image_label
+    global _preview_source_pixmap, _preview_source_pixmap_path, _preview_pixmap_refresh_generation
+    global _previous_island_fill_enabled
     _preview_display_scale = PREVIEW_DEFAULT_DISPLAY_SCALE
     _preview_image_size = (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION)
     _preview_image_path = None
     _preview_image_label = None
+    _preview_source_pixmap = None
+    _preview_source_pixmap_path = None
+    _preview_pixmap_refresh_generation += 1
+    _previous_island_fill_enabled = False
 
     gOptionBoxTemplateOffsetText = mel.eval("""$tmp = $gOptionBoxTemplateOffsetText;""")  #  type: int
     gOptionBoxTemplateTextColumnWidth = mel.eval("""$tmp = $gOptionBoxTemplateTextColumnWidth;""")  #  type: int
@@ -1445,7 +1523,7 @@ def show_ui():
         "islandFillEnabled",
         label="",
         value=False,
-        changeCommand=lambda *_args: (_update_island_fill_controls(), schedule_preview_refresh(immediate=True)),
+        changeCommand=_on_island_fill_enabled_changed,
     )
     cmds.text(label="Opacity", align="right")
     cmds.intField(
