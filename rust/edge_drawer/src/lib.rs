@@ -3050,18 +3050,16 @@ fn draw_island_fill_distance_field_raster(
         let Some(bounds) = fill_bounds[fill_index] else {
             continue;
         };
-        let (min_x, max_x, min_y, max_y) = pixel_range_for_bounds(bounds, 0.0, width, height);
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let point = pixel_center(x, y);
-                if point_in_overlay_shapes(point, shapes) {
-                    let index = pixel_index(x, y, width);
-                    body_mask[index] = true;
-                    owner_distances[index] = -1.0;
-                    owner_indices[index] = fill_index;
-                }
-            }
-        }
+        rasterize_overlay_shapes_body(
+            shapes,
+            bounds,
+            fill_index,
+            width,
+            height,
+            &mut body_mask,
+            &mut owner_distances,
+            &mut owner_indices,
+        );
     }
 
     for (fill_index, fill) in fills.iter().enumerate() {
@@ -3069,23 +3067,30 @@ fn draw_island_fill_distance_field_raster(
         if padding_pixels <= 0.0 {
             continue;
         }
-        let Some(bounds) = fill_bounds[fill_index] else {
-            continue;
-        };
         let padding_squared = padding_pixels * padding_pixels;
-        let (min_x, max_x, min_y, max_y) =
-            pixel_range_for_bounds(bounds, padding_pixels, width, height);
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let index = pixel_index(x, y, width);
-                if body_mask[index] {
-                    continue;
-                }
-                let point = pixel_center(x, y);
-                let distance = distance_to_overlay_shapes_squared(point, &fill_shapes[fill_index]);
-                if distance <= padding_squared && distance < owner_distances[index] {
-                    owner_distances[index] = distance;
-                    owner_indices[index] = fill_index;
+        for shape in &fill_shapes[fill_index] {
+            for contour in shape {
+                for segment_index in 0..contour.len() {
+                    let start = contour[segment_index];
+                    let end = contour[(segment_index + 1) % contour.len()];
+                    let bounds = segment_bounds(start, end);
+                    let (min_x, max_x, min_y, max_y) =
+                        pixel_range_for_bounds(bounds, padding_pixels, width, height);
+
+                    for y in min_y..=max_y {
+                        for x in min_x..=max_x {
+                            let index = pixel_index(x, y, width);
+                            if body_mask[index] {
+                                continue;
+                            }
+                            let point = pixel_center(x, y);
+                            let distance = distance_to_segment_squared(point, start, end);
+                            if distance <= padding_squared && distance < owner_distances[index] {
+                                owner_distances[index] = distance;
+                                owner_indices[index] = fill_index;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3123,55 +3128,81 @@ fn pixel_index(x: u32, y: u32, width: u32) -> usize {
     y as usize * width as usize + x as usize
 }
 
-fn point_in_overlay_shapes(point: OverlayPoint, shapes: &OverlayShapes) -> bool {
-    shapes.iter().any(|shape| {
-        shape.iter().fold(false, |inside, contour| {
-            inside ^ point_in_overlay_contour(point, contour)
-        })
-    })
+fn rasterize_overlay_shapes_body(
+    shapes: &OverlayShapes,
+    bounds: OverlayBounds,
+    fill_index: usize,
+    width: u32,
+    height: u32,
+    body_mask: &mut [bool],
+    owner_distances: &mut [f64],
+    owner_indices: &mut [usize],
+) {
+    let (_min_x, _max_x, min_y, max_y) = pixel_range_for_bounds(bounds, 0.0, width, height);
+    let mut intersections = Vec::new();
+
+    for y in min_y..=max_y {
+        let y_center = y as f64 + 0.5;
+        intersections.clear();
+
+        for shape in shapes {
+            for contour in shape {
+                collect_scanline_intersections(contour, y_center, &mut intersections);
+            }
+        }
+
+        if intersections.len() < 2 {
+            continue;
+        }
+        intersections.sort_by(|left, right| left.total_cmp(right));
+
+        for pair in intersections.chunks_exact(2) {
+            let left = pair[0];
+            let right = pair[1];
+            if right <= left {
+                continue;
+            }
+
+            let start = ((left - 0.5).ceil()).clamp(0.0, width as f64) as u32;
+            let end = ((right - 0.5).ceil()).clamp(0.0, width as f64) as u32;
+            for x in start..end {
+                let index = pixel_index(x, y, width);
+                body_mask[index] = true;
+                owner_distances[index] = -1.0;
+                owner_indices[index] = fill_index;
+            }
+        }
+    }
 }
 
-fn point_in_overlay_contour(point: OverlayPoint, contour: &OverlayContour) -> bool {
+fn collect_scanline_intersections(
+    contour: &OverlayContour,
+    y: f64,
+    intersections: &mut Vec<f64>,
+) {
     if contour.len() < 3 {
-        return false;
+        return;
     }
-    let mut inside = false;
+
     let mut previous = *contour.last().expect("contour is non-empty");
     for &current in contour {
-        let intersects = ((current[1] > point[1]) != (previous[1] > point[1]))
-            && (point[0]
-                < (previous[0] - current[0]) * (point[1] - current[1])
-                    / (previous[1] - current[1])
-                    + current[0]);
-        if intersects {
-            inside = !inside;
+        if (current[1] > y) != (previous[1] > y) {
+            let x = (previous[0] - current[0]) * (y - current[1])
+                / (previous[1] - current[1])
+                + current[0];
+            intersections.push(x);
         }
         previous = current;
     }
-    inside
 }
 
-fn distance_to_overlay_shapes_squared(point: OverlayPoint, shapes: &OverlayShapes) -> f64 {
-    let mut best = f64::INFINITY;
-    for shape in shapes {
-        for contour in shape {
-            best = best.min(distance_to_overlay_contour_squared(point, contour));
-        }
+fn segment_bounds(start: OverlayPoint, end: OverlayPoint) -> OverlayBounds {
+    OverlayBounds {
+        min_x: start[0].min(end[0]),
+        min_y: start[1].min(end[1]),
+        max_x: start[0].max(end[0]),
+        max_y: start[1].max(end[1]),
     }
-    best
-}
-
-fn distance_to_overlay_contour_squared(point: OverlayPoint, contour: &OverlayContour) -> f64 {
-    if contour.is_empty() {
-        return f64::INFINITY;
-    }
-    let mut best = f64::INFINITY;
-    for index in 0..contour.len() {
-        let start = contour[index];
-        let end = contour[(index + 1) % contour.len()];
-        best = best.min(distance_to_segment_squared(point, start, end));
-    }
-    best
 }
 
 fn distance_to_segment_squared(point: OverlayPoint, start: OverlayPoint, end: OverlayPoint) -> f64 {
