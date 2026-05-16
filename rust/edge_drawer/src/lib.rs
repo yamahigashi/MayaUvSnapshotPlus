@@ -11,7 +11,9 @@ use serde::Deserialize;
 use svg::node::element::path::Data;
 use svg::node::element::Path as SvgPath;
 use svg::Document;
-use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
+};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -20,6 +22,22 @@ const SAMPLE_EPSILON: f32 = 1e-4;
 const AREA_EPSILON: f32 = 1e-8;
 const DEFAULT_WARNING_COLOR: [u8; 4] = [255, 64, 64, 255];
 const DEFAULT_WARNING_WIDTH: f32 = 4.0;
+const DEFAULT_ISLAND_FILL_OPACITY: f32 = 0.25;
+const DEFAULT_ISLAND_FILL_PADDING_PIXELS: f32 = 0.0;
+const ISLAND_FILL_PALETTE: [[u8; 3]; 12] = [
+    [94, 176, 255],
+    [255, 173, 77],
+    [117, 209, 140],
+    [245, 118, 136],
+    [171, 132, 255],
+    [84, 203, 196],
+    [235, 215, 93],
+    [255, 139, 213],
+    [138, 183, 86],
+    [111, 136, 214],
+    [227, 147, 103],
+    [103, 190, 231],
+];
 
 fn default_true() -> bool {
     true
@@ -50,6 +68,17 @@ pub struct DrawerPayload {
     pub edges: Vec<Edges>,
     pub polygons: Vec<Polygon>,
     pub padding_warning: Option<PaddingWarningConfig>,
+    pub island_fill: Option<IslandFillConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct IslandFillConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_island_fill_opacity")]
+    opacity: f32,
+    #[serde(default = "default_island_fill_padding_pixels")]
+    padding_pixels: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +148,15 @@ struct PreparedGroup {
 
 #[derive(Clone, Debug)]
 struct PreparedDrawing {
+    fills: Vec<PreparedFill>,
     groups: Vec<PreparedGroup>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedFill {
+    fill_color: [u8; 4],
+    padding_pixels: f32,
+    paths: Vec<Vec<QPoint>>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +200,7 @@ struct CompactPayload {
     point_positions: Arc<HashMap<QPoint, [f32; 2]>>,
     polygons: Vec<Polygon>,
     padding_warning: Option<PaddingWarningConfig>,
+    island_fill: Option<IslandFillConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +329,14 @@ fn default_warning_width() -> f32 {
     DEFAULT_WARNING_WIDTH
 }
 
+fn default_island_fill_opacity() -> f32 {
+    DEFAULT_ISLAND_FILL_OPACITY
+}
+
+fn default_island_fill_padding_pixels() -> f32 {
+    DEFAULT_ISLAND_FILL_PADDING_PIXELS
+}
+
 pub fn parse_edges_json(edges_json: &str) -> Result<Vec<Edges>, BoxError> {
     Ok(parse_drawer_payload(edges_json)?.edges)
 }
@@ -304,6 +350,7 @@ pub fn parse_drawer_payload(edges_json: &str) -> Result<DrawerPayload, BoxError>
             edges,
             polygons: Vec::new(),
             padding_warning: None,
+            island_fill: None,
         });
     }
 
@@ -321,14 +368,21 @@ pub fn parse_drawer_payload(edges_json: &str) -> Result<DrawerPayload, BoxError>
         None => Vec::new(),
     };
     let padding_warning = match payload_object.get("padding_warning").cloned() {
-        Some(value) => Some(serde_json::from_value(value)?),
+        Some(value) if !value.is_null() => Some(serde_json::from_value(value)?),
         None => None,
+        _ => None,
+    };
+    let island_fill = match payload_object.get("island_fill").cloned() {
+        Some(value) if !value.is_null() => Some(serde_json::from_value(value)?),
+        None => None,
+        _ => None,
     };
 
     Ok(DrawerPayload {
         edges,
         polygons,
         padding_warning,
+        island_fill,
     })
 }
 
@@ -374,6 +428,7 @@ pub fn draw_to_path_from_payload(
         width,
         height,
         payload.padding_warning.as_ref(),
+        payload.island_fill.as_ref(),
     );
     log_profile("prepare_total", prepare_started_at);
 
@@ -406,6 +461,7 @@ pub fn draw_to_path_from_edges(
             edges: edges.to_vec(),
             polygons: Vec::new(),
             padding_warning: None,
+            island_fill: None,
         },
     )
 }
@@ -416,6 +472,7 @@ fn prepare_drawing(
     width: u32,
     height: u32,
     padding_warning: Option<&PaddingWarningConfig>,
+    island_fill: Option<&IslandFillConfig>,
 ) -> PreparedDrawing {
     let arrangement_started_at = Instant::now();
     let styles = edges
@@ -450,6 +507,10 @@ fn prepare_drawing(
     );
     log_profile("warning", warning_started_at);
 
+    let fill_started_at = Instant::now();
+    let fills = build_island_fills(polygons, island_fill);
+    log_profile("island_fill", fill_started_at);
+
     let path_started_at = Instant::now();
     let mut normal_bucket_order = Vec::new();
     let mut overlay_bucket_order = Vec::new();
@@ -478,7 +539,7 @@ fn prepare_drawing(
     ));
     log_profile("path_build", path_started_at);
 
-    PreparedDrawing { groups }
+    PreparedDrawing { fills, groups }
 }
 
 fn prepare_drawing_from_compact(
@@ -513,6 +574,10 @@ fn prepare_drawing_from_compact(
     );
     log_profile("warning", warning_started_at);
 
+    let fill_started_at = Instant::now();
+    let fills = build_island_fills(&payload.polygons, payload.island_fill.as_ref());
+    log_profile("island_fill", fill_started_at);
+
     let path_started_at = Instant::now();
     let mut normal_bucket_order = Vec::new();
     let mut overlay_bucket_order = Vec::new();
@@ -541,7 +606,7 @@ fn prepare_drawing_from_compact(
     ));
     log_profile("path_build", path_started_at);
 
-    PreparedDrawing { groups }
+    PreparedDrawing { fills, groups }
 }
 
 fn point_position(point_positions: &PointPositionIndex, point: QPoint) -> [f32; 2] {
@@ -1131,6 +1196,164 @@ fn materialize_style_buckets(
         });
     }
     groups
+}
+
+fn build_island_fills(
+    polygons: &[Polygon],
+    island_fill: Option<&IslandFillConfig>,
+) -> Vec<PreparedFill> {
+    let Some(island_fill) = island_fill else {
+        return Vec::new();
+    };
+    if !island_fill.enabled {
+        return Vec::new();
+    }
+
+    let opacity = island_fill.opacity.clamp(0.0, 1.0);
+    if opacity <= 0.0 || polygons.is_empty() {
+        return Vec::new();
+    }
+    let alpha = (opacity * 255.0).round() as u8;
+    let padding_pixels = island_fill.padding_pixels.max(0.0);
+
+    let Some(arrangement) = build_polygon_boundary_arrangement(polygons) else {
+        return Vec::new();
+    };
+    let (_internal_segments, outline_segments) = classify_segments(
+        &arrangement.segments,
+        &arrangement.point_positions,
+        polygons,
+    );
+    fills_from_outline_segments(
+        &outline_segments,
+        &arrangement.point_positions,
+        alpha,
+        padding_pixels,
+    )
+}
+
+fn build_polygon_boundary_arrangement(polygons: &[Polygon]) -> Option<SegmentArrangement> {
+    let mut point_positions = HashMap::new();
+    let mut original_segments = Vec::new();
+    let mut original_segment_set = HashSet::new();
+
+    for polygon in polygons {
+        let Some(path) = quantized_polygon_path(polygon) else {
+            continue;
+        };
+        for &position in &polygon.points {
+            point_positions
+                .entry(quantize_point(position))
+                .or_insert(position);
+        }
+        for segment in polygon_path_edges(&path) {
+            if original_segment_set.insert(segment) {
+                original_segments.push(segment);
+            }
+        }
+    }
+
+    if original_segments.is_empty() {
+        return None;
+    }
+
+    original_segments.sort_by_key(|segment| (segment.start, segment.end));
+    let group_segments = vec![original_segments.clone()];
+    let group_segment_indices = vec![(0..original_segments.len()).collect::<Vec<_>>()];
+    Some(build_segment_arrangement_from_parts(
+        original_segments,
+        Arc::new(point_positions),
+        &group_segments,
+        &group_segment_indices,
+    ))
+}
+
+fn fills_from_outline_segments(
+    outline_segments: &HashSet<CanonicalSegment>,
+    point_positions: &PointPositionIndex,
+    alpha: u8,
+    padding_pixels: f32,
+) -> Vec<PreparedFill> {
+    if outline_segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted_segments = outline_segments.iter().copied().collect::<Vec<_>>();
+    sorted_segments.sort_by_key(|segment| (segment.start, segment.end));
+    let adjacency = build_adjacency(&sorted_segments, point_positions);
+    let component_map = compute_components(&adjacency);
+    let mut component_order = Vec::new();
+    let mut component_segments = HashMap::<usize, Vec<SegmentInfo>>::new();
+
+    for segment in sorted_segments {
+        let component_id = component_map
+            .get(&segment.start)
+            .copied()
+            .unwrap_or_default();
+        if !component_segments.contains_key(&component_id) {
+            component_order.push(component_id);
+            component_segments.insert(component_id, Vec::new());
+        }
+        component_segments
+            .get_mut(&component_id)
+            .expect("component segment bucket must exist")
+            .push(segment_from_canonical(segment));
+    }
+
+    let mut fills = Vec::new();
+    for component_id in component_order {
+        let Some(segments) = component_segments.remove(&component_id) else {
+            continue;
+        };
+        let paths = build_paths_from_segments(&segments)
+            .into_iter()
+            .filter(|path| path.len() >= 3 && path.first() == path.last())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
+        let fill_index = fills.len();
+        fills.push(PreparedFill {
+            fill_color: island_fill_color(fill_index, alpha),
+            padding_pixels,
+            paths,
+        });
+    }
+
+    fills
+}
+
+fn quantized_polygon_path(polygon: &Polygon) -> Option<Vec<QPoint>> {
+    if polygon.points.len() < 3 {
+        return None;
+    }
+
+    let mut path = Vec::with_capacity(polygon.points.len() + 1);
+    for &point in &polygon.points {
+        let quantized = quantize_point(point);
+        if path.last().copied() == Some(quantized) {
+            continue;
+        }
+        path.push(quantized);
+    }
+    if path.len() >= 3 && path.first() == path.last() {
+        path.pop();
+    }
+    if path.len() < 3 {
+        return None;
+    }
+    path.push(path[0]);
+    Some(path)
+}
+
+fn polygon_path_edges(path: &[QPoint]) -> impl Iterator<Item = CanonicalSegment> + '_ {
+    path.windows(2)
+        .filter_map(|points| canonical_segment(points[0], points[1]))
+}
+
+fn island_fill_color(index: usize, alpha: u8) -> [u8; 4] {
+    let rgb = ISLAND_FILL_PALETTE[index % ISLAND_FILL_PALETTE.len()];
+    [rgb[0], rgb[1], rgb[2], alpha]
 }
 
 fn collect_arrangement_inputs(edges: &[Edges]) -> ArrangementInputs {
@@ -2487,6 +2710,36 @@ fn trace_path(
 fn draw_edges_svg(prepared: &PreparedDrawing, width: u32, height: u32) -> Document {
     let mut document = Document::new().set("viewBox", (0, 0, width, height));
 
+    for fill in &prepared.fills {
+        if fill.paths.is_empty() {
+            continue;
+        }
+
+        let color = format!(
+            "rgb({}, {}, {})",
+            fill.fill_color[0], fill.fill_color[1], fill.fill_color[2]
+        );
+        let opacity = fill.fill_color[3] as f32 / 255.0;
+
+        for path in &fill.paths {
+            let Some(data) = svg_path_data(path, width, height) else {
+                continue;
+            };
+
+            let svg_path = SvgPath::new()
+                .set("fill", color.clone())
+                .set("fill-opacity", opacity)
+                .set("stroke", color.clone())
+                .set("stroke-opacity", opacity)
+                .set("stroke-width", fill.padding_pixels * 2.0)
+                .set("stroke-linecap", "round")
+                .set("stroke-linejoin", "round")
+                .set("d", data);
+
+            document = document.add(svg_path);
+        }
+    }
+
     for group in &prepared.groups {
         if group.paths.is_empty() {
             continue;
@@ -2541,6 +2794,42 @@ fn draw_edges_raster(
 ) -> Result<Pixmap, BoxError> {
     let mut pixmap =
         Pixmap::new(width, height).ok_or_else(|| "failed to allocate raster pixmap".to_string())?;
+
+    for fill in &prepared.fills {
+        if fill.paths.is_empty() {
+            continue;
+        }
+
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            fill.fill_color[0],
+            fill.fill_color[1],
+            fill.fill_color[2],
+            fill.fill_color[3],
+        ));
+
+        for path in &fill.paths {
+            let Some(sk_path) = build_skia_path(path, width, height) else {
+                continue;
+            };
+            pixmap.fill_path(
+                &sk_path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+            if fill.padding_pixels > 0.0 {
+                let stroke = Stroke {
+                    width: (fill.padding_pixels * 2.0).max(0.5),
+                    line_cap: LineCap::Round,
+                    line_join: LineJoin::Round,
+                    ..Stroke::default()
+                };
+                pixmap.stroke_path(&sk_path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+    }
 
     for group in &prepared.groups {
         if group.paths.is_empty() {
@@ -2693,6 +2982,9 @@ fn compact_payload_from_buffers(
     padding_pixels: f32,
     warning_width: f32,
     warning_color: Vec<u8>,
+    island_fill_enabled: bool,
+    island_fill_opacity: f32,
+    island_fill_padding_pixels: f32,
 ) -> Result<CompactPayload, BoxError> {
     let group_count = group_internal_widths.len();
     if group_line_offsets.len() != group_count + 1
@@ -2795,6 +3087,15 @@ fn compact_payload_from_buffers(
     } else {
         None
     };
+    let island_fill = if island_fill_enabled {
+        Some(IslandFillConfig {
+            enabled: true,
+            opacity: island_fill_opacity,
+            padding_pixels: island_fill_padding_pixels,
+        })
+    } else {
+        None
+    };
 
     let group_segment_indices = build_group_segment_indices(&original_segments, &group_segments);
 
@@ -2806,6 +3107,7 @@ fn compact_payload_from_buffers(
         point_positions: Arc::new(point_positions),
         polygons,
         padding_warning,
+        island_fill,
     })
 }
 
@@ -2914,6 +3216,9 @@ fn draw_edges_buffered_py(
     padding_pixels: f32,
     warning_width: f32,
     warning_color: Vec<u8>,
+    island_fill_enabled: bool,
+    island_fill_opacity: f32,
+    island_fill_padding_pixels: f32,
 ) -> PyResult<()> {
     let payload = compact_payload_from_buffers(
         group_line_offsets,
@@ -2930,6 +3235,9 @@ fn draw_edges_buffered_py(
         padding_pixels,
         warning_width,
         warning_color,
+        island_fill_enabled,
+        island_fill_opacity,
+        island_fill_padding_pixels,
     )
     .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
     let prepare_started_at = Instant::now();
@@ -3049,6 +3357,39 @@ mod tests {
             }}"#,
             padding_pixels
         )
+    }
+
+    fn payload_with_island_fill_json() -> String {
+        r#"{
+            "edges": [
+                {
+                    "outline_color": [255, 255, 255, 255],
+                    "outline_width": 4.0,
+                    "draw_outline": true,
+                    "draw_internal": false,
+                    "lines": [
+                        {"uv1": [0.1, 0.1], "uv2": [0.5, 0.1]},
+                        {"uv1": [0.5, 0.1], "uv2": [0.5, 0.5]},
+                        {"uv1": [0.5, 0.5], "uv2": [0.1, 0.5]},
+                        {"uv1": [0.1, 0.5], "uv2": [0.1, 0.1]},
+                        {"uv1": [0.6, 0.1], "uv2": [0.9, 0.1]},
+                        {"uv1": [0.9, 0.1], "uv2": [0.9, 0.4]},
+                        {"uv1": [0.9, 0.4], "uv2": [0.6, 0.4]},
+                        {"uv1": [0.6, 0.4], "uv2": [0.6, 0.1]}
+                    ]
+                }
+            ],
+            "polygons": [
+                {"points": [[0.1, 0.1], [0.5, 0.1], [0.5, 0.5], [0.1, 0.5]]},
+                {"points": [[0.6, 0.1], [0.9, 0.1], [0.9, 0.4], [0.6, 0.4]]}
+            ],
+            "island_fill": {
+                "enabled": true,
+                "opacity": 0.25,
+                "padding_pixels": 3.0
+            }
+        }"#
+        .to_string()
     }
 
     fn two_outline_islands_json() -> String {
@@ -3217,11 +3558,37 @@ mod tests {
         assert_eq!(payload.edges.len(), 1);
         assert_eq!(payload.polygons.len(), 1);
         assert!(payload.padding_warning.is_some());
+        assert!(payload.island_fill.is_none());
         let warning = payload.padding_warning.unwrap();
         assert!(warning.enabled);
         assert_eq!(warning.padding_pixels, 8.0);
         assert_eq!(warning.warning_width, 6.0);
         assert_eq!(warning.warning_color, [255, 64, 64, 255]);
+    }
+
+    #[test]
+    fn test_parse_drawer_payload_island_fill() {
+        let payload = parse_drawer_payload(&payload_with_island_fill_json()).unwrap();
+        let island_fill = payload.island_fill.unwrap();
+        assert!(island_fill.enabled);
+        assert_eq!(island_fill.opacity, 0.25);
+        assert_eq!(island_fill.padding_pixels, 3.0);
+    }
+
+    #[test]
+    fn test_parse_drawer_payload_ignores_null_optional_configs() {
+        let payload = parse_drawer_payload(
+            r#"{
+                "edges": [],
+                "polygons": [],
+                "padding_warning": null,
+                "island_fill": null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(payload.padding_warning.is_none());
+        assert!(payload.island_fill.is_none());
     }
 
     #[test]
@@ -3322,10 +3689,55 @@ mod tests {
     #[test]
     fn test_prepared_groups_split_internal_and_outline_widths() {
         let edges = parse_edges_json(&square_with_diagonal_json(true, true)).unwrap();
-        let prepared = prepare_drawing(&edges, &[], 128, 128, None);
+        let prepared = prepare_drawing(&edges, &[], 128, 128, None, None);
         assert_eq!(prepared.groups.len(), 2);
         assert_eq!(prepared.groups[0].line_width, 3.0);
         assert_eq!(prepared.groups[1].line_width, 6.0);
+    }
+
+    #[test]
+    fn test_island_fill_groups_separated_polygons() {
+        let payload = parse_drawer_payload(&payload_with_island_fill_json()).unwrap();
+        let prepared = prepare_drawing(
+            &payload.edges,
+            &payload.polygons,
+            128,
+            128,
+            None,
+            payload.island_fill.as_ref(),
+        );
+
+        assert_eq!(prepared.fills.len(), 2);
+        assert_eq!(prepared.fills[0].fill_color[3], 64);
+        assert_eq!(prepared.fills[0].paths.len(), 1);
+        assert_eq!(prepared.fills[1].paths.len(), 1);
+    }
+
+    #[test]
+    fn test_island_fill_keeps_edge_connected_polygons_one_island() {
+        let polygons = vec![
+            Polygon {
+                points: vec![[0.1, 0.1], [0.5, 0.1], [0.5, 0.5], [0.1, 0.5]],
+            },
+            Polygon {
+                points: vec![[0.5, 0.1], [0.9, 0.1], [0.9, 0.5], [0.5, 0.5]],
+            },
+        ];
+        let fills = build_island_fills(
+            &polygons,
+            Some(&IslandFillConfig {
+                enabled: true,
+                opacity: 0.25,
+                padding_pixels: 0.0,
+            }),
+        );
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].paths.len(), 1);
+        assert!(!fills[0].paths[0].windows(2).any(|points| {
+            canonical_segment(points[0], points[1])
+                == canonical_segment(quantize_point([0.5, 0.1]), quantize_point([0.5, 0.5]))
+        }));
     }
 
     #[test]
@@ -3540,6 +3952,24 @@ mod tests {
     }
 
     #[test]
+    fn test_draw_png_to_path_with_island_fill() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().join("filled_edge.png");
+
+        draw_to_path(
+            image_path.as_path(),
+            128,
+            128,
+            &payload_with_island_fill_json(),
+        )
+        .unwrap();
+
+        assert!(image_path.exists());
+        let bytes = fs::read(&image_path).unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
     fn test_draw_svg_to_path() {
         let dir = tempdir().unwrap();
         let image_path = dir.path().join("edge.svg");
@@ -3556,6 +3986,25 @@ mod tests {
         assert!(contents.contains("<svg"));
         assert!(contents.contains("stroke-linejoin=\"round\""));
         assert!(contents.contains("stroke-width=\"6\""));
+    }
+
+    #[test]
+    fn test_draw_svg_to_path_with_island_fill_writes_fill_before_stroke() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().join("filled_edge.svg");
+
+        draw_to_path(
+            image_path.as_path(),
+            128,
+            128,
+            &payload_with_island_fill_json(),
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&image_path).unwrap();
+        let fill_index = contents.find("fill-opacity").unwrap();
+        let stroke_index = contents.find("stroke-linejoin").unwrap();
+        assert!(fill_index < stroke_index);
     }
 
     #[test]

@@ -88,6 +88,8 @@ _MESH_TOPOLOGY_CACHE = {}
 _MESH_DIRTY_CALLBACKS = {}
 DEFAULT_PADDING_WARNING_COLOR = [255, 64, 64, 255]
 DEFAULT_PADDING_WARNING_WIDTH = 4.0
+DEFAULT_ISLAND_FILL_OPACITY = 0.25
+DEFAULT_ISLAND_FILL_PADDING_PIXELS = 0.0
 TOPOLOGY_WARMUP_BATCH_ITEMS = 256
 TOPOLOGY_WARMUP_BUDGET_MS = 5.0
 WINDOWS_COMMAND_LINE_JSON_LIMIT = 30000
@@ -519,9 +521,10 @@ class DrawerPayloadBuffers(object):
         polygon_offsets,
         polygon_points,
         padding_warning,
+        island_fill,
         json_fallback_edges,
     ):
-        # type: (List[int], List[float], List[float], List[float], List[int], List[int], List[bool], List[bool], List[int], List[float], Optional[Dict[Text, Any]], List[EdgeLineDrawInfo]) -> None
+        # type: (List[int], List[float], List[float], List[float], List[int], List[int], List[bool], List[bool], List[int], List[float], Optional[Dict[Text, Any]], Optional[Dict[Text, Any]], List[EdgeLineDrawInfo]) -> None
         self.group_line_offsets = group_line_offsets
         self.line_points = line_points
         self.group_internal_widths = group_internal_widths
@@ -533,19 +536,22 @@ class DrawerPayloadBuffers(object):
         self.polygon_offsets = polygon_offsets
         self.polygon_points = polygon_points
         self.padding_warning = padding_warning
+        self.island_fill = island_fill
         self._json_fallback_edges = json_fallback_edges
         self._json_string = None
 
     def as_json_string(self):
         # type: () -> Text
         if self._json_string is None:
-            self._json_string = edges_to_json_string(
-                {
-                    "edges": self._json_fallback_edges,
-                    "polygons": _polygons_from_flat_buffers(self.polygon_offsets, self.polygon_points),
-                    "padding_warning": self.padding_warning,
-                }
-            )
+            payload = {
+                "edges": self._json_fallback_edges,
+                "polygons": _polygons_from_flat_buffers(self.polygon_offsets, self.polygon_points),
+            }
+            if self.padding_warning is not None:
+                payload["padding_warning"] = self.padding_warning
+            if self.island_fill is not None:
+                payload["island_fill"] = self.island_fill
+            self._json_string = edges_to_json_string(payload)
         return self._json_string
 
 
@@ -939,6 +945,7 @@ def build_drawer_payload_buffers(payload):
             polygon_offsets.append(polygon_point_count)
 
     padding_warning = payload.get("padding_warning")
+    island_fill = payload.get("island_fill")
     return DrawerPayloadBuffers(
         group_line_offsets=group_line_offsets,
         line_points=line_points,
@@ -951,6 +958,7 @@ def build_drawer_payload_buffers(payload):
         polygon_offsets=polygon_offsets,
         polygon_points=polygon_points,
         padding_warning=padding_warning,
+        island_fill=island_fill,
         json_fallback_edges=merged_groups,
     )
 
@@ -1208,6 +1216,7 @@ def render_payload_to_path(image_path, width, height, payload_data):
             if isinstance(payload_data, DrawerPayloadBuffers) and hasattr(_edge_drawer, "draw_edges_buffered"):
                 warning = payload_data.padding_warning or {}
                 warning_color = warning.get("warning_color", DEFAULT_PADDING_WARNING_COLOR)
+                island_fill = payload_data.island_fill or {}
                 _edge_drawer.draw_edges_buffered(
                     image_path,
                     width,
@@ -1226,6 +1235,9 @@ def render_payload_to_path(image_path, width, height, payload_data):
                     float(warning.get("padding_pixels", 8.0)),
                     float(warning.get("warning_width", DEFAULT_PADDING_WARNING_WIDTH)),
                     [int(value) for value in warning_color],
+                    bool(island_fill.get("enabled", False)),
+                    float(island_fill.get("opacity", DEFAULT_ISLAND_FILL_OPACITY)),
+                    float(island_fill.get("padding_pixels", DEFAULT_ISLAND_FILL_PADDING_PIXELS)),
                 )
             else:
                 json_data = payload_data.as_json_string() if isinstance(payload_data, DrawerPayloadBuffers) else payload_data

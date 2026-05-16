@@ -53,6 +53,8 @@ EDGE_APPEARANCE_SPECS = [
 PREVIEW_MAX_DIMENSION = 512
 WARNING_COLOR = (1.0, 0.43, 0.05)
 WARNING_WIDTH = 16
+ISLAND_FILL_OPACITY = 25
+ISLAND_FILL_PADDING = 0
 PREVIEW_DEBOUNCE_MS = 150
 PREVIEW_RENDER_WORKERS = 1
 PREVIEW_FRAME_LABEL = "Preview"
@@ -586,6 +588,34 @@ def _get_warning_color():
     )
 
 
+def _sync_island_fill_opacity_from_slider(value):
+    # type: (int) -> None
+    cmds.intField("islandFillOpacityField", edit=True, value=int(value))
+    schedule_preview_refresh(immediate=False)
+
+
+def _sync_island_fill_opacity_from_field(value):
+    # type: (int) -> None
+    value = max(0, min(100, int(value)))
+    cmds.intField("islandFillOpacityField", edit=True, value=value)
+    cmds.intSlider("islandFillOpacitySlider", edit=True, value=value)
+    schedule_preview_refresh(immediate=True)
+
+
+def _sync_island_fill_padding_from_slider(value):
+    # type: (int) -> None
+    cmds.intField("islandFillPaddingField", edit=True, value=int(value))
+    schedule_preview_refresh(immediate=False)
+
+
+def _sync_island_fill_padding_from_field(value):
+    # type: (int) -> None
+    value = max(0, min(100, int(value)))
+    cmds.intField("islandFillPaddingField", edit=True, value=value)
+    cmds.intSlider("islandFillPaddingSlider", edit=True, value=value)
+    schedule_preview_refresh(immediate=True)
+
+
 def _collect_selected_meshes():
     # type: () -> List[Text]
     try:
@@ -619,6 +649,9 @@ def _collect_snapshot_settings():
         "padding_pixels": cmds.intField("paddingPixelsField", query=True, value=True),
         "padding_warning_color": _get_warning_color(),
         "padding_warning_width": cmds.intField("paddingWarningEdgeWidthField", query=True, value=True),
+        "island_fill_enabled": cmds.checkBox("islandFillEnabled", query=True, value=True),
+        "island_fill_opacity": cmds.intField("islandFillOpacityField", query=True, value=True) / 100.0,
+        "island_fill_padding": cmds.intField("islandFillPaddingField", query=True, value=True),
         "soft_internal_color": _get_edge_color("soft", "Internal"),
         "hard_internal_color": _get_edge_color("hard", "Internal"),
         "border_internal_color": _get_edge_color("border", "Internal"),
@@ -747,6 +780,18 @@ def _build_padding_warning_settings(settings, width_scale=1.0):
     }
 
 
+def _build_island_fill_settings(settings, width_scale=1.0):
+    # type: (Dict[Text, Any], float) -> Optional[Dict[Text, Any]]
+    if not settings["island_fill_enabled"]:
+        return None
+
+    return {
+        "enabled": True,
+        "opacity": max(0.0, min(1.0, float(settings["island_fill_opacity"]))),
+        "padding_pixels": max(0.0, float(settings["island_fill_padding"]) * width_scale),
+    }
+
+
 def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     # type: (Dict[Text, Any], List[Any], float) -> Any
     started_at = time.time()
@@ -790,6 +835,9 @@ def _build_payload_from_snapshots(settings, snapshots, width_scale=1.0):
     }
     if padding_warning is not None:
         payload["padding_warning"] = padding_warning
+    island_fill = _build_island_fill_settings(settings, width_scale=width_scale)
+    if island_fill is not None:
+        payload["island_fill"] = island_fill
 
     phase_started = time.perf_counter()
     payload_data = drawer.build_drawer_payload_buffers(payload)
@@ -1116,6 +1164,85 @@ def show_ui():
     cmds.setParent("..")
 
     slider_width = gOptionBoxTemplateTextColumnWidth + gOptionBoxTemplateSliderWidgetWidth + 72
+
+    island_fill_slider_width = max(72, int(slider_width / 2) - 54)
+    cmds.rowLayout(
+        numberOfColumns=8,
+        adjustableColumn=8,
+        columnAlign=[
+            (1, "right"),
+            (2, "left"),
+            (3, "right"),
+            (4, "left"),
+            (5, "left"),
+            (6, "right"),
+            (7, "left"),
+            (8, "left"),
+        ],
+        columnAttach=[
+            (1, "both", 0),
+            (2, "both", 0),
+            (3, "both", 0),
+            (4, "both", 0),
+            (5, "both", 0),
+            (6, "both", 0),
+            (7, "both", 0),
+            (8, "both", 0),
+        ],
+        columnWidth=[
+            (1, 120),
+            (2, 24),
+            (3, 54),
+            (4, 42),
+            (5, island_fill_slider_width),
+            (6, 54),
+            (7, 42),
+            (8, island_fill_slider_width),
+        ],
+    )
+    cmds.text(label="Island Fill:", align="right")
+    cmds.checkBox(
+        "islandFillEnabled",
+        label="",
+        value=False,
+        changeCommand=lambda *_args: (_update_island_fill_controls(), schedule_preview_refresh(immediate=True)),
+    )
+    cmds.text(label="Opacity", align="right")
+    cmds.intField(
+        "islandFillOpacityField",
+        minValue=0,
+        maxValue=100,
+        value=ISLAND_FILL_OPACITY,
+        changeCommand=_sync_island_fill_opacity_from_field,
+    )
+    cmds.intSlider(
+        "islandFillOpacitySlider",
+        min=0,
+        max=100,
+        value=ISLAND_FILL_OPACITY,
+        step=1,
+        dragCommand=_sync_island_fill_opacity_from_slider,
+        changeCommand=_sync_island_fill_opacity_from_slider,
+    )
+    cmds.text(label="Padding", align="right")
+    cmds.intField(
+        "islandFillPaddingField",
+        minValue=0,
+        maxValue=100,
+        value=ISLAND_FILL_PADDING,
+        changeCommand=_sync_island_fill_padding_from_field,
+    )
+    cmds.intSlider(
+        "islandFillPaddingSlider",
+        min=0,
+        max=100,
+        value=ISLAND_FILL_PADDING,
+        step=1,
+        dragCommand=_sync_island_fill_padding_from_slider,
+        changeCommand=_sync_island_fill_padding_from_slider,
+    )
+    cmds.setParent("..")
+
     for edge_key, label, color, width in EDGE_APPEARANCE_SPECS:
         _create_edge_appearance_row(edge_key, label, color, width, slider_width)
 
@@ -1301,6 +1428,7 @@ def update_controls(*args):
         label="Take Snap Shot!" if file_mode else "Copy Snapshot",
     )
     _update_padding_warning_controls()
+    _update_island_fill_controls()
 
 
 def _update_padding_warning_controls():
@@ -1310,6 +1438,15 @@ def _update_padding_warning_controls():
     cmds.button("paddingWarningColorSwatch", edit=True, enable=enabled)
     cmds.intField("paddingWarningEdgeWidthField", edit=True, enable=enabled)
     cmds.intSlider("paddingWarningEdgeWidthSlider", edit=True, enable=enabled)
+
+
+def _update_island_fill_controls():
+    # type: () -> None
+    enabled = cmds.checkBox("islandFillEnabled", query=True, value=True)
+    cmds.intField("islandFillOpacityField", edit=True, enable=enabled)
+    cmds.intSlider("islandFillOpacitySlider", edit=True, enable=enabled)
+    cmds.intField("islandFillPaddingField", edit=True, enable=enabled)
+    cmds.intSlider("islandFillPaddingSlider", edit=True, enable=enabled)
 
 
 def get_uv_min_max():
